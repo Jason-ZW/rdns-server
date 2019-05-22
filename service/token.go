@@ -26,7 +26,7 @@ func getBaseFqdn(fqdn string) string {
 
 func generateToken(fqdn string) (string, error) {
 	b := backend.GetBackend()
-	origin, err := b.GetTokenOrigin(fqdn)
+	origin, err := b.GetToken(fqdn)
 	if err != nil {
 		logrus.Errorf("Failed to get token origin %s, err: %v", fqdn, err)
 		return "", err
@@ -58,7 +58,7 @@ func compareToken(fqdn, token string) bool {
 	}
 
 	b := backend.GetBackend()
-	origin, err := b.GetTokenOrigin(fqdn)
+	origin, err := b.GetToken(fqdn)
 	if err != nil {
 		logrus.Errorf("Failed to get token origin %s, err: %v", fqdn, err)
 		return false

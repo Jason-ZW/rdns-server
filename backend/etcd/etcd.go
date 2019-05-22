@@ -10,693 +10,485 @@ import (
 	"github.com/rancher/rdns-server/model"
 	"github.com/rancher/rdns-server/util"
 
-	"github.com/coreos/etcd/client"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	"go.etcd.io/etcd/clientv3"
 )
 
 const (
-	BackendName  = "etcd"
-	ValueHostKey = "host"
-	ValueTextKey = "text"
-	DefaultTTL   = "240h"
-
+	TTL              = "240h"
+	Name             = "etcdv3"
+	frozenPath       = "/frozenv3"
+	tokenPath        = "/tokenv3"
+	tokenLength      = 32
+	slugLength       = 6
 	maxSlugHashTimes = 100
-	tokenOriginPath  = "/token_origin"
-
-	slugLength        = 6
-	tokenOriginLength = 32
 )
 
-type BackendOperator struct {
-	kapi       client.KeysAPI
-	prePath    string
-	duration   time.Duration
-	rootDomain string
-	frozenTime string
+type Backend struct {
+	ClientV3 *clientv3.Client
+	duration time.Duration
+	frozen   string
+	path     string
+	domain   string
 }
 
-func NewEtcdBackend(endpoints []string, prePath string, rootDomain string, frozenTime string) (*BackendOperator, error) {
-	logrus.Debugf("Etcd init...")
-	cfg := client.Config{
-		Endpoints: endpoints,
-		Transport: client.DefaultTransport,
-		// set timeout per request to fail fast when the target endpoint is unavailable
-		HeaderTimeoutPerRequest: time.Second,
+func NewBackend(endpoints []string, path, domain, frozen string) (*Backend, error) {
+	cfg := clientv3.Config{
+		Endpoints:   endpoints,
+		DialTimeout: 5 * time.Second,
 	}
-	c, err := client.New(cfg)
+	c, err := clientv3.New(cfg)
 	if err != nil {
 		return nil, err
 	}
-	kapi := client.NewKeysAPI(c)
-
-	duration, err := time.ParseDuration(DefaultTTL)
+	d, err := time.ParseDuration(TTL)
 	if err != nil {
 		return nil, err
 	}
-
-	return &BackendOperator{kapi, prePath, duration, rootDomain, frozenTime}, nil
+	return &Backend{c, d, frozen, path, domain}, nil
 }
 
-func (e *BackendOperator) path(domainName string) string {
-	return e.prePath + convertToPath(domainName)
-}
+func (b *Backend) Get(opts *model.DomainOptions) (d model.Domain, err error) {
+	logrus.Debugf("Get A record for domain options: %s", opts.String())
 
-func (e *BackendOperator) tokenOriginPath(domainName string) string {
-	return tokenOriginPath + "/" + formatKey(domainName)
-}
+	path := getPath(b.path, opts.Fqdn)
 
-func (e *BackendOperator) lookupHosts(path string) (hosts []string, err error) {
-	opts := &client.GetOptions{Recursive: true}
-	resp, err := e.kapi.Get(context.Background(), path, opts)
+	// lookup all keys under the path
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resp, err := b.ClientV3.Get(ctx, path, clientv3.WithPrefix())
+	cancel()
 	if err != nil {
-		return hosts, err
+		return d, errors.Wrapf(err, "Failed to lookup keys under the path: %s", path)
 	}
-	for _, n := range resp.Node.Nodes {
-		v, err := convertToMap(n.Value)
+
+	var lease int64
+	hosts := make([]string, 0)
+	for _, kv := range resp.Kvs {
+		lease = kv.Lease
+		v, err := unmarshalToMap(kv.Value)
 		if err != nil {
-			return hosts, err
+			return d, err
 		}
-		hosts = append(hosts, v[ValueHostKey])
+		hosts = append(hosts, v["host"])
+	}
+
+	// get lease from lease ID
+	ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+	leaseResp, err := b.ClientV3.TimeToLive(ctx, clientv3.LeaseID(lease))
+	cancel()
+	if err != nil {
+		return d, err
+	}
+
+	// TODO: sub-domain logic will be added
+
+	d.Fqdn = opts.Fqdn
+	d.Hosts = hosts
+	duration, _ := time.ParseDuration(fmt.Sprintf("%ds", leaseResp.TTL))
+	e := time.Now().Add(duration)
+	d.Expiration = &e
+
+	return d, nil
+}
+
+func (b *Backend) Set(opts *model.DomainOptions) (d model.Domain, err error) {
+	logrus.Debugf("Set A record for domain options: %s", opts.String())
+
+	var path string
+	for i := 0; i < maxSlugHashTimes; i++ {
+		fqdn := fmt.Sprintf("%s.%s", generateSlug(), b.domain)
+
+		// check whether this fqdn can be used or not
+		if b.checkFrozen(fqdn) {
+			logrus.Debugf("Failed to use fqdn: %s because it is frozen, will try another", fqdn)
+			continue
+		}
+
+		path = getPath(b.path, fqdn)
+
+		// check whether this path can be used or not
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := b.ClientV3.Get(ctx, path)
+		cancel()
+		if err != nil || resp.Count <= 0 {
+			opts.Fqdn = fqdn
+			break
+		}
+	}
+
+	// set A record to etcd
+	d, err = b.setRecordA(path, opts, false)
+	if err != nil {
+		return d, err
+	}
+
+	// set frozen for this fqdn, used to check whether fqdn can be issued again later
+	if err := b.setFrozen(opts, false); err != nil {
+		return d, err
+	}
+
+	return b.Get(opts)
+}
+
+func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) {
+	logrus.Debugf("Update A record for domain options: %s", opts.String())
+
+	path := getPath(b.path, opts.Fqdn)
+
+	// get A record
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resp, err := b.ClientV3.Get(ctx, path, clientv3.WithPrefix())
+	cancel()
+	if err != nil || resp.Count <= 0 {
+		return d, errors.Wrapf(err, "Failed to update A record for %s", path)
+	}
+
+	d, err = b.setRecordA(path, opts, true)
+	if err != nil {
+		return d, errors.Wrapf(err, "Failed to update A record for %s", path)
+	}
+
+	return d, b.setFrozen(opts, true)
+}
+
+func (b *Backend) Delete(opts *model.DomainOptions) error {
+	logrus.Debugf("Delete A record for domain options: %s", opts.String())
+
+	path := getPath(b.path, opts.Fqdn)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err := b.ClientV3.Delete(ctx, path, clientv3.WithPrefix())
+	cancel()
+	if err != nil {
+		return errors.Wrapf(err, "Failed to delete A record for %s", path)
+	}
+
+	// TODO: sub-domain logic will be deleted
+
+	return nil
+}
+
+func (b *Backend) Renew(opts *model.DomainOptions) (d model.Domain, err error) {
+	logrus.Debugf("Renew for domain options: %s", opts.String())
+
+	path := getPath(b.path, opts.Fqdn)
+
+	leaseID, leaseTTL, err := b.setToken(opts, true)
+	if err != nil {
+		return d, errors.Wrapf(err, "Failed to set token for %s", path)
+	}
+
+	// keep-alive once for lease's ID
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	keepalive, err := b.ClientV3.KeepAliveOnce(ctx, clientv3.LeaseID(leaseID))
+	cancel()
+	if err != nil {
+		return d, errors.Wrapf(err, "Failed to keep-alive-once for lease: %s", leaseID)
+	}
+
+	leaseTTL = keepalive.TTL
+
+	// lookup all keys under the path
+	hosts, err := b.lookupKeys(path)
+	if err != nil {
+		return d, err
+	}
+
+	// TODO: sub-domain logic will be added
+
+	// TODO: acme-text logic will be added
+
+	d.Fqdn = opts.Fqdn
+	d.Hosts = hosts
+	duration, _ := time.ParseDuration(fmt.Sprintf("%ds", leaseTTL))
+	e := time.Now().Add(duration)
+	d.Expiration = &e
+
+	return d, b.setFrozen(opts, true)
+}
+
+func (b *Backend) SetText(opts *model.DomainOptions) (d model.Domain, err error) {
+	return model.Domain{}, nil
+}
+
+func (b *Backend) GetText(opts *model.DomainOptions) (d model.Domain, err error) {
+	return model.Domain{}, nil
+}
+
+func (b *Backend) UpdateText(opts *model.DomainOptions) (d model.Domain, err error) {
+	return model.Domain{}, nil
+}
+
+func (b *Backend) DeleteText(opts *model.DomainOptions) error {
+	return nil
+}
+
+func (b *Backend) GetToken(fqdn string) (string, error) {
+	logrus.Debugf("Get token for fqdn: %s", fqdn)
+
+	path := getTokenPath(fqdn)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resp, err := b.ClientV3.Get(ctx, path)
+	cancel()
+	if err != nil || resp.Count <= 0 {
+		return "", errors.Wrapf(err, "Not found key: %s", path)
+	}
+
+	return string(resp.Kvs[0].Value), nil
+}
+
+func (b *Backend) setRecordA(path string, opts *model.DomainOptions, exist bool) (d model.Domain, err error) {
+	leaseID, leaseTTL, err := b.setToken(opts, exist)
+	if err != nil {
+		return d, err
+	}
+
+	// lookup all keys under the path
+	hosts, err := b.lookupKeys(path)
+	if err != nil {
+		return d, err
+	}
+
+	// sync records
+	if err := b.syncRecords(opts.Hosts, hosts, path, clientv3.LeaseID(leaseID)); err != nil {
+		return d, errors.Wrapf(err, "Failed to sync keys under the path: %s", path)
+	}
+
+	d.Fqdn = opts.Fqdn
+	d.Hosts = opts.Hosts
+	duration, _ := time.ParseDuration(fmt.Sprintf("%ds", leaseTTL))
+	e := time.Now().Add(duration)
+	d.Expiration = &e
+
+	// TODO: sub-domain logic will be added
+
+	return d, nil
+}
+
+// Used to lookup all keys under the path
+func (b *Backend) lookupKeys(path string) ([]string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resp, err := b.ClientV3.Get(ctx, path, clientv3.WithPrefix())
+	cancel()
+	if err != nil {
+		return []string{}, errors.Wrapf(err, "Failed to lookup keys under the path: %s", path)
+	}
+
+	hosts := make([]string, 0)
+	for _, kv := range resp.Kvs {
+		v, err := unmarshalToMap(kv.Value)
+		if err != nil {
+			return []string{}, err
+		}
+		hosts = append(hosts, v["host"])
 	}
 
 	return hosts, nil
 }
 
-func (e *BackendOperator) lookupSubPath(path string) (paths []string) {
-	opts := &client.GetOptions{Recursive: true}
-	resp, err := e.kapi.Get(context.Background(), path, opts)
-	if err != nil {
-		return paths
-	}
-	for _, n := range resp.Node.Nodes {
-		paths = append(paths, n.Key)
-	}
-	return paths
-}
+// Used to sync to new records and remove useless keys
+func (b *Backend) syncRecords(new, old []string, path string, leaseID clientv3.LeaseID) error {
+	left := sliceToMap(new)
+	right := sliceToMap(old)
 
-func (e *BackendOperator) refreshExpiration(path string, dopts *model.DomainOptions) (d model.Domain, err error) {
-	err = e.setTokenOrigin(dopts, true)
-	if err != nil {
-		return d, err
-	}
-
-	logrus.Debugf("Etcd: refresh dir TTL: %s", path)
-	opts := &client.SetOptions{TTL: e.duration, Dir: true, PrevExist: client.PrevExist}
-	resp, err := e.kapi.Set(context.Background(), path, "", opts)
-	if err != nil {
-		return d, err
-	}
-
-	curHosts, err := e.lookupHosts(path)
-	if err != nil {
-		return d, err
-	}
-
-	d.Fqdn = dopts.Fqdn
-	d.Hosts = curHosts
-	d.Expiration = resp.Node.Expiration
-
-	// sub-domain record should be refresh expiration
-	subDomain := make(map[string][]string, 0)
-
-	// sub-domain record: _sub-domain.xxx.x1.lb.rancher.cloud [1.1.1.1,2.2.2.2]
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/1.1.1.1
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/2.2.2.2
-	subDomainRoot := fmt.Sprintf("%s.%s", "_sub-domain", dopts.Fqdn)
-	subDomainRootSlice := strings.Split(subDomainRoot, ".")
-	subDomainPath := fmt.Sprintf("%s/%s", e.prePath, strings.Join(subDomainRootSlice, "/"))
-	subPath := e.lookupSubPath(subDomainPath)
-
-	for _, p := range subPath {
-		// create sub-domain path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx
-		opts := &client.SetOptions{TTL: e.duration, Dir: true, PrevExist: client.PrevExist}
-		_, err := e.kapi.Set(context.Background(), p, "", opts)
-		if err != nil {
-			return d, err
-		}
-		// get current hosts
-		curHosts, err := e.lookupHosts(p)
-		if err != nil {
-			return d, err
-		}
-
-		slice := strings.Split(p, "/")
-		subDomain[slice[len(slice)-1]] = curHosts
-	}
-
-	d.SubDomain = subDomain
-
-	// acme text record should be refresh expiration
-	getOpts := &client.GetOptions{Sort: true, Recursive: true}
-	getResp, err := e.kapi.Get(context.Background(), e.prePath+"/_txt/_acme-challenge", getOpts)
-	if err == nil {
-		subKeys := nodesToStringSlice(getResp.Node.Nodes)
-		for _, key := range subKeys {
-			splits := strings.Split(dopts.Fqdn, ".")
-			source := strings.Join(splits, "/")
-			if strings.Contains(key, source) {
-				// get value and refresh expiration
-				getResp, err = e.kapi.Get(context.Background(), key, &client.GetOptions{})
-				if err != nil {
-					return d, err
-				}
-				acmeOpts := &client.SetOptions{TTL: e.duration, PrevExist: client.PrevExist}
-				_, err := e.kapi.Set(context.Background(), key, getResp.Node.Value, acmeOpts)
-				if err != nil {
-					return d, err
-				}
-			}
-		}
-	} else {
-		// ignore txt key not found error
-		return d, nil
-	}
-	return d, err
-}
-
-func (e *BackendOperator) setTokenOrigin(dopts *model.DomainOptions, exist bool) error {
-	var tokenOrigin string
-	opts := &client.SetOptions{TTL: e.duration}
-	if exist {
-		opts.PrevExist = client.PrevExist
-	}
-	tokenOriginPath := e.tokenOriginPath(dopts.Fqdn)
-	resp, err := e.kapi.Get(context.Background(), tokenOriginPath, nil)
-	if resp != nil {
-		tokenOrigin = resp.Node.Value
-		logrus.Debugf("setTokenOrigin: Got an exist token origin: %s", tokenOrigin)
-	} else {
-		tokenOrigin = generateTokenOrigin()
-		logrus.Debugf("setTokenOrigin: Generrated a new token origin: %s", tokenOrigin)
-	}
-
-	logrus.Debugf("Etcd: set a path for token origin: %s, %s", tokenOriginPath, tokenOrigin)
-	_, err = e.kapi.Set(context.Background(), tokenOriginPath, tokenOrigin, opts)
-	return err
-}
-
-func (e *BackendOperator) set(path string, dopts *model.DomainOptions, exist bool) (d model.Domain, err error) {
-	err = e.setTokenOrigin(dopts, exist)
-	if err != nil {
-		return d, err
-	}
-
-	// set domain record
-	logrus.Debugf("Etcd: set a dir for record: %s", path)
-	opts := &client.SetOptions{TTL: e.duration, Dir: true}
-	if exist {
-		opts.PrevExist = client.PrevExist
-	}
-	resp, err := e.kapi.Set(context.Background(), path, "", opts)
-	if err != nil {
-		return d, err
-	}
-
-	// get current hosts
-	curHosts, err := e.lookupHosts(path)
-	if err != nil {
-		return d, err
-	}
-
-	// set key value
-	newHostsMap := sliceToMap(dopts.Hosts)
-	logrus.Debugf("Got new hosts map: %v", newHostsMap)
-	oldHostsMap := sliceToMap(curHosts)
-	logrus.Debugf("Got old hosts map: %v", oldHostsMap)
-	for oldh := range oldHostsMap {
-		if _, ok := newHostsMap[oldh]; !ok {
-			key := fmt.Sprintf("%s/%s", path, formatKey(oldh))
-			logrus.Debugf("Etcd: delete a key/value: %s:%s", key, formatValue(oldh))
-			_, err := e.kapi.Delete(context.Background(), key, nil)
+	for r := range right {
+		if _, ok := left[r]; !ok {
+			key := fmt.Sprintf("%s/%s", path, formatKey(r))
+			// delete useless key
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, err := b.ClientV3.Delete(ctx, key)
+			cancel()
 			if err != nil {
-				return d, err
+				return err
 			}
 		}
 	}
-	for newh := range newHostsMap {
-		if _, ok := oldHostsMap[newh]; !ok {
-			key := fmt.Sprintf("%s/%s", path, formatKey(newh))
-			logrus.Debugf("Etcd: set a key/value: %s:%s", key, formatValue(newh))
-			_, err := e.kapi.Set(context.Background(), key, formatValue(newh), nil)
+
+	for l := range left {
+		if _, ok := right[l]; !ok {
+			key := fmt.Sprintf("%s/%s", path, formatKey(l))
+			// set new key
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			_, err := b.ClientV3.Put(ctx, key, formatValue(l), clientv3.WithLease(leaseID))
+			cancel()
 			if err != nil {
-				return d, err
+				return err
 			}
 		}
 	}
 
-	d.Fqdn = dopts.Fqdn
-	d.Hosts = dopts.Hosts
-	d.Expiration = resp.Node.Expiration
-
-	// create sub-domain if exists.
-	subDomain, err := e.setSubDomain(dopts)
-	if err != nil {
-		return d, err
-	}
-	d.SubDomain = subDomain
-
-	logrus.Debugf("Finished to set a domain entry: %s", d.String())
-	return d, nil
+	return nil
 }
 
-func (e *BackendOperator) checkFrozen(fqdn string) bool {
-	splits := strings.SplitN(fqdn, ".", 2)
-	path := fmt.Sprintf("/rdns/_frozen/%s", splits[0])
-	_, err := e.kapi.Get(context.Background(), path, nil)
-	if err != nil && client.IsKeyNotFound(err) {
+func (b *Backend) setToken(opts *model.DomainOptions, exist bool) (int64, int64, error) {
+	logrus.Debugf("Set token for fqdn: %s", opts.Fqdn)
+
+	var token string
+	var leaseID int64
+	var leaseTTL int64
+
+	path := getTokenPath(opts.Fqdn)
+
+	if exist {
+		// get token and lease's ID
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := b.ClientV3.Get(ctx, path)
+		cancel()
+		if err != nil || resp.Count <= 0 {
+			return 0, -1, errors.Wrapf(err, "Not found previous key: %s", path)
+		}
+
+		token = string(resp.Kvs[0].Value)
+		l := resp.Kvs[0].Lease
+
+		// get lease with leaseID
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		lease, err := b.ClientV3.TimeToLive(ctx, clientv3.LeaseID(l))
+		cancel()
+		if err != nil {
+			return 0, -1, errors.Wrapf(err, "Failed to get lease for %s", path)
+		}
+		leaseID = int64(lease.ID)
+		leaseTTL = lease.TTL
+	} else {
+		token = util.RandStringWithAll(tokenLength)
+
+		// create lease with duration
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		lease, err := b.ClientV3.Grant(ctx, int64(b.duration.Seconds()))
+		cancel()
+		if err != nil {
+			return 0, -1, errors.Wrapf(err, "Failed to grant lease: %s", path)
+		}
+		leaseID = int64(lease.ID)
+		leaseTTL = lease.TTL
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err := b.ClientV3.Put(ctx, path, token, clientv3.WithLease(clientv3.LeaseID(leaseID)))
+	cancel()
+
+	return leaseID, leaseTTL, errors.Wrapf(err, "Failed to set key: %s", path)
+}
+
+// Used to set frozen record which will determine whether fqdn can be issued again
+// e.g. sample.lb.rancher.cloud => /frozenv3/sample
+func (b *Backend) setFrozen(opts *model.DomainOptions, exist bool) error {
+	logrus.Debugf("Set frozen for fqdn: %s", opts.Fqdn)
+
+	duration, err := time.ParseDuration(b.frozen)
+	if err != nil {
+		return err
+	}
+
+	ss := strings.SplitN(opts.Fqdn, ".", 2)
+	path := fmt.Sprintf("%s%s/%s", b.path, frozenPath, ss[0])
+
+	var leaseID int64
+
+	if exist {
+		// get leaseID
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		resp, err := b.ClientV3.Get(ctx, path, clientv3.WithPrefix())
+		cancel()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to lookup keys under the path: %s", path)
+		}
+		for _, kv := range resp.Kvs {
+			leaseID = kv.Lease
+		}
+		// get lease with ID
+		ctx, cancel = context.WithTimeout(context.Background(), 10*time.Second)
+		lease, err := b.ClientV3.TimeToLive(ctx, clientv3.LeaseID(leaseID))
+		cancel()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to get lease for %s", path)
+		}
+		leaseID = int64(lease.ID)
+	} else {
+		// create lease with frozen time
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		lease, err := b.ClientV3.Grant(ctx, int64(duration.Seconds()))
+		cancel()
+		if err != nil {
+			return errors.Wrapf(err, "Failed to set lease for %s", path)
+		}
+		leaseID = int64(lease.ID)
+	}
+
+	// create frozen path with lease
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, err = b.ClientV3.Put(ctx, path, "", clientv3.WithLease(clientv3.LeaseID(leaseID)))
+	cancel()
+	if err != nil {
+		return errors.Wrapf(err, "Failed to set key %s with lease %d", path, clientv3.LeaseID(leaseID))
+	}
+
+	return nil
+}
+
+// Used to check whether fqdn can be used.
+// e.g. sample.lb.rancher.cloud => /frozenv3/sample
+// e.g. if /frozenv3/sample is exist that fqdn can not be used
+func (b *Backend) checkFrozen(fqdn string) bool {
+	ss := strings.SplitN(fqdn, ".", 2)
+	path := fmt.Sprintf("%s%s/%s", b.path, frozenPath, ss[0])
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	resp, err := b.ClientV3.Get(ctx, path)
+	cancel()
+	if err != nil || resp.Count <= 0 {
 		return false
 	}
 	return true
 }
 
-func (e *BackendOperator) setFrozen(dopts *model.DomainOptions) error {
-	duration, err := time.ParseDuration(e.frozenTime)
-	if err != nil {
-		return err
-	}
-
-	splits := strings.SplitN(dopts.Fqdn, ".", 2)
-	path := fmt.Sprintf("/rdns/_frozen/%s", splits[0])
-
-	// check if this path exists
-	exist := false
-	if e.checkFrozen(dopts.Fqdn) {
-		exist = true
-	}
-
-	// create frozen path with ttl
-	logrus.Debugf("Etcd: set a frozen dir: %s", path)
-	opts := &client.SetOptions{TTL: duration, Dir: true}
-	if exist {
-		opts.PrevExist = client.PrevExist
-	}
-	if _, err := e.kapi.Set(context.Background(), path, "", opts); err != nil {
-		return err
-	}
-
-	return nil
+// Used to get a path as etcd preferred
+// e.g. sample.lb.rancher.cloud => /rdnsv3/cloud/rancher/lb/sample
+func getPath(path, domain string) string {
+	return path + convertToPath(domain)
 }
 
-func (e *BackendOperator) updateFrozen(dopts *model.DomainOptions) error {
-	duration, err := time.ParseDuration(e.frozenTime)
-	if err != nil {
-		return err
-	}
-
-	splits := strings.SplitN(dopts.Fqdn, ".", 2)
-	path := fmt.Sprintf("/rdns/_frozen/%s", splits[0])
-
-	// check if this path exists
-	exist := false
-	if e.checkFrozen(dopts.Fqdn) {
-		exist = true
-	}
-	opts := &client.SetOptions{TTL: duration, Dir: true}
-	if exist {
-		opts.PrevExist = client.PrevExist
-	}
-
-	if _, err := e.kapi.Set(context.Background(), path, "", opts); err != nil {
-		return err
-	}
-
-	return nil
+// Used to get a token path as etcd preferred
+// e.g. sample.lb.rancher.cloud => /tokenv3/sample_lb_rancher_cloud
+func getTokenPath(domain string) string {
+	return fmt.Sprintf("%s/%s", tokenPath, formatKey(domain))
 }
 
-func (e *BackendOperator) setSubDomain(dopts *model.DomainOptions) (s map[string][]string, err error) {
-	var path string
-	subDomain := make(map[string][]string, 0)
-	fqdn := dopts.Fqdn
-	for subPrefix, subHosts := range dopts.SubDomain {
-		// sub-domain record: _sub-domain.xxx.x1.lb.rancher.cloud [1.1.1.1,2.2.2.2]
-		// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/1.1.1.1
-		// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/2.2.2.2
-		temp := fmt.Sprintf("%s.%s.%s", "_sub-domain", fqdn, subPrefix)
-		tempSlice := strings.Split(temp, ".")
-		path = fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-
-		// check sub-domain path exist /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/
-		exist := false
-		resp, err := e.kapi.Get(context.Background(), path, &client.GetOptions{})
-		if err == nil && resp != nil && resp.Node.Dir {
-			logrus.Debugf("%s: is a directory", resp.Node.Key)
-			exist = true
-		}
-
-		// create sub-domain path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx
-		opts := &client.SetOptions{TTL: e.duration, Dir: true}
-		if exist {
-			opts.PrevExist = client.PrevExist
-		}
-		_, err = e.kapi.Set(context.Background(), path, "", opts)
-		if err != nil {
-			return subDomain, err
-		}
-
-		// get current hosts
-		curHosts, err := e.lookupHosts(path)
-		if err != nil {
-			return subDomain, err
-		}
-
-		newHostsMap := sliceToMap(subHosts)
-		logrus.Debugf("Got new sub-domain hosts map: %v", newHostsMap)
-		oldHostsMap := sliceToMap(curHosts)
-		logrus.Debugf("Got old sub-domain hosts map: %v", oldHostsMap)
-		for oldh := range oldHostsMap {
-			if _, ok := newHostsMap[oldh]; !ok {
-				key := fmt.Sprintf("%s/%s", path, formatKey(oldh))
-				logrus.Debugf("Etcd: delete a sub-domain key/value: %s:%s", key, formatValue(oldh))
-				_, err := e.kapi.Delete(context.Background(), key, nil)
-				if err != nil {
-					return subDomain, err
-				}
-			}
-		}
-		for newh := range newHostsMap {
-			if _, ok := oldHostsMap[newh]; !ok {
-				key := fmt.Sprintf("%s/%s", path, formatKey(newh))
-				logrus.Debugf("Etcd: set a sub-domain key/value: %s:%s", key, formatValue(newh))
-				_, err := e.kapi.Set(context.Background(), key, formatValue(newh), nil)
-				if err != nil {
-					return subDomain, err
-				}
-			}
-		}
-	}
-
-	subDomain = dopts.SubDomain
-
-	return subDomain, nil
+// Used to format a key as etcd preferred
+// e.g. 1.1.1.1 => 1_1_1_1
+// e.g. sample.lb.rancher.cloud => sample_lb_rancher_cloud
+func formatKey(key string) string {
+	return strings.Replace(key, ".", "_", -1)
 }
 
-func (e *BackendOperator) setText(path string, dopts *model.DomainOptions, exist bool) (d model.Domain, err error) {
-	opts := &client.SetOptions{TTL: e.duration}
-	if exist {
-		opts.PrevExist = client.PrevExist
-	}
-	resp, err := e.kapi.Set(context.Background(), path, formatTextValue(dopts.Text), opts)
-	if err != nil {
-		return d, err
-	}
-
-	d.Fqdn = dopts.Fqdn
-	d.Text = dopts.Text
-	d.Expiration = resp.Node.Expiration
-	logrus.Debugf("Finished to set a domain entry: %s", d.String())
-
-	return d, nil
+// Used to format a value as dns preferred
+// e.g. 1.1.1.1 => {"host": "1.1.1.1"}
+func formatValue(value string) string {
+	return fmt.Sprintf("{\"host\":\"%s\"}", value)
 }
 
-func (e *BackendOperator) Get(dopts *model.DomainOptions) (d model.Domain, err error) {
-	logrus.Debugf("Get in etcd: Got the domain options entry: %s", dopts.String())
-	path := e.path(dopts.Fqdn)
-	//opts := &client.GetOptions{Recursive: true}
-	resp, err := e.kapi.Get(context.Background(), path, nil)
-	if err != nil {
-		return d, err
-	}
-
-	d.Fqdn = dopts.Fqdn
-	d.Expiration = resp.Node.Expiration
-	for _, n := range resp.Node.Nodes {
-		if n.Dir {
-			continue
-		}
-		v, err := convertToMap(n.Value)
-		if err != nil {
-			return d, err
-		}
-		d.Hosts = append(d.Hosts, v[ValueHostKey])
-	}
-
-	// sub-domain information need to be added
-	subDomain := make(map[string][]string, 0)
-	// sub-domain record: _sub-domain.xxx.x1.lb.rancher.cloud [1.1.1.1,2.2.2.2]
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/1.1.1.1
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/2.2.2.2
-	subDomainRoot := fmt.Sprintf("%s.%s", "_sub-domain", dopts.Fqdn)
-	subDomainRootSlice := strings.Split(subDomainRoot, ".")
-	subDomainPath := fmt.Sprintf("%s/%s", e.prePath, strings.Join(subDomainRootSlice, "/"))
-	subPath := e.lookupSubPath(subDomainPath)
-
-	for _, p := range subPath {
-		// get current hosts
-		curHosts, err := e.lookupHosts(p)
-		if err != nil {
-			return d, err
-		}
-
-		slice := strings.Split(p, "/")
-		subDomain[slice[len(slice)-1]] = curHosts
-	}
-
-	d.SubDomain = subDomain
-
-	return d, nil
+// Used to generate a random slug
+func generateSlug() string {
+	return util.RandStringWithSmall(slugLength)
 }
 
-func (e *BackendOperator) Create(dopts *model.DomainOptions) (d model.Domain, err error) {
-	logrus.Debugf("Create in etcd: Got the domain options entry: %s", dopts.String())
-	var path string
-	for i := 0; i < maxSlugHashTimes; i++ {
-		fqdn := fmt.Sprintf("%s.%s", generateSlug(), e.rootDomain)
-		path = e.path(fqdn)
-
-		// check if this path is frozen
-		if e.checkFrozen(fqdn) {
-			logrus.Debugf("%s is frozen will try another", fqdn)
-			continue
-		}
-
-		// check if this path exists and use this path if not exist
-		_, err := e.kapi.Get(context.Background(), path, nil)
-		if err != nil && client.IsKeyNotFound(err) {
-			dopts.Fqdn = fqdn
-			break
-		}
-	}
-
-	d, err = e.set(path, dopts, false)
-	if err != nil {
-		return d, err
-	}
-
-	// save the domain name to the /rdns/_frozen/xxxx which will later determine if fqdn can be issued again.
-	if err := e.setFrozen(dopts); err != nil {
-		return d, err
-	}
-
-	return e.Get(dopts)
-}
-
-func (e *BackendOperator) Update(dopts *model.DomainOptions) (d model.Domain, err error) {
-	exist := false
-	logrus.Debugf("Update in etcd: Got the domain options entry: %s", dopts.String())
-	path := e.path(dopts.Fqdn)
-
-	resp, err := e.kapi.Get(context.Background(), path, &client.GetOptions{})
-	if err == nil && resp != nil && resp.Node.Dir {
-		logrus.Debugf("%s: is a directory", resp.Node.Key)
-		exist = true
-	}
-
-	d, err = e.set(path, dopts, exist)
-	if err != nil {
-		return d, err
-	}
-	return d, e.updateFrozen(dopts)
-}
-
-func (e *BackendOperator) Renew(dopts *model.DomainOptions) (d model.Domain, err error) {
-	logrus.Debugf("Renew in etcd: Got the domain options entry: %s", dopts.String())
-	path := e.path(dopts.Fqdn)
-
-	d, err = e.refreshExpiration(path, dopts)
-	if err != nil {
-		return d, err
-	}
-	return d, e.updateFrozen(dopts)
-}
-
-func (e *BackendOperator) Delete(dopts *model.DomainOptions) error {
-	logrus.Debugf("Delete in etcd: Got the domain options entry: %s", dopts.String())
-	path := e.path(dopts.Fqdn)
-
-	opts := &client.DeleteOptions{Dir: true, Recursive: true}
-	_, err := e.kapi.Delete(context.Background(), path, opts)
-	if err != nil {
-		return err
-	}
-
-	// sub-domain path need to be deleted, also. /rdns/_sub-domain/x1/lb/rancher/cloud
-	// sub-domain record: _sub-domain.xxx.x1.lb.rancher.cloud [1.1.1.1,2.2.2.2]
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/1.1.1.1
-	// need save to the path /rdns/_sub-domain/x1/lb/rancher/cloud/xxx/2.2.2.2
-	temp := fmt.Sprintf("%s.%s", "_sub-domain", dopts.Fqdn)
-	tempSlice := strings.Split(temp, ".")
-	subPath := fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-	if _, err := e.kapi.Delete(context.Background(), subPath, opts); err != nil && !client.IsKeyNotFound(err) {
-		return err
-	}
-	return nil
-}
-
-func (e *BackendOperator) CreateText(dopts *model.DomainOptions) (d model.Domain, err error) {
-	logrus.Debugf("Create in etcd: Got the domain options entry: %s", dopts.String())
-
-	fqdn := dopts.Fqdn
-	var path string
-	// acme text record: _acme-challenge.x1.lb.rancher.cloud
-	if strings.Contains(fqdn, "_acme-challenge") {
-		// need save to the path /rdns/_txt/_acme-challenge/x1/lb/rancher/cloud
-		temp := fmt.Sprintf("%s.%s", "_txt", fqdn)
-		tempSlice := strings.Split(temp, ".")
-		path = fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-	} else {
-		// normal text record: xxxx.lb.rancher.cloud
-		path = e.path(fqdn)
-	}
-
-	exist := true
-	// check if this path exists
-	_, err = e.kapi.Get(context.Background(), path, nil)
-	if err != nil && client.IsKeyNotFound(err) {
-		exist = false
-	}
-
-	d, err = e.setText(path, dopts, exist)
-	if err != nil {
-		return d, err
-	}
-
-	return d, err
-}
-
-func (e *BackendOperator) GetText(dopts *model.DomainOptions) (d model.Domain, err error) {
-	logrus.Debugf("Get in etcd: Got the domain options entry: %s", dopts.String())
-	fqdn := dopts.Fqdn
-	var path string
-	// acme text record: _acme-challenge.x1.lb.rancher.cloud
-	if strings.Contains(fqdn, "_acme-challenge") {
-		// need save to the path /rdns/_txt/_acme-challenge/x1/lb/rancher/cloud
-		temp := fmt.Sprintf("%s.%s", "_txt", fqdn)
-		tempSlice := strings.Split(temp, ".")
-		path = fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-	} else {
-		// normal text record: xxxx.lb.rancher.cloud
-		path = e.path(fqdn)
-	}
-
-	//opts := &client.GetOptions{Recursive: true}
-	resp, err := e.kapi.Get(context.Background(), path, nil)
-	if err != nil {
-		return d, err
-	}
-
-	d.Fqdn = dopts.Fqdn
-	d.Expiration = resp.Node.Expiration
-	d.Text = resp.Node.Value
-
-	return d, nil
-}
-
-func (e *BackendOperator) UpdateText(dopts *model.DomainOptions) (d model.Domain, err error) {
-	exist := false
-	logrus.Debugf("Update in etcd: Got the domain options entry: %s", dopts.String())
-	fqdn := dopts.Fqdn
-	var path string
-	// acme text record: _acme-challenge.x1.lb.rancher.cloud
-	if strings.Contains(fqdn, "_acme-challenge") {
-		// need save to the path /rdns/_txt/_acme-challenge/x1/lb/rancher/cloud
-		temp := fmt.Sprintf("%s.%s", "_txt", fqdn)
-		tempSlice := strings.Split(temp, ".")
-		path = fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-	} else {
-		// normal text record: xxxx.lb.rancher.cloud
-		path = e.path(fqdn)
-	}
-
-	resp, err := e.kapi.Get(context.Background(), path, &client.GetOptions{})
-	if err == nil && resp != nil && resp.Node.Dir {
-		logrus.Debugf("%s: is a directory", resp.Node.Key)
-		exist = true
-	}
-
-	d, err = e.setText(path, dopts, exist)
-	return d, err
-}
-
-func (e *BackendOperator) DeleteText(dopts *model.DomainOptions) error {
-	logrus.Debugf("Delete in etcd: Got the domain options entry: %s", dopts.String())
-	fqdn := dopts.Fqdn
-	var path string
-	// acme text record: _acme-challenge.x1.lb.rancher.cloud
-	if strings.Contains(fqdn, "_acme-challenge") {
-		// need save to the path /rdns/_txt/_acme-challenge/x1/lb/rancher/cloud
-		temp := fmt.Sprintf("%s.%s", "_txt", fqdn)
-		tempSlice := strings.Split(temp, ".")
-		path = fmt.Sprintf("%s/%s", e.prePath, strings.Join(tempSlice, "/"))
-	} else {
-		// normal text record: xxxx.lb.rancher.cloud
-		path = e.path(fqdn)
-	}
-
-	opts := &client.DeleteOptions{Dir: true, Recursive: true}
-	_, err := e.kapi.Delete(context.Background(), path, opts)
-	return err
-}
-
-func (e *BackendOperator) GetTokenOrigin(fqdn string) (string, error) {
-	logrus.Debugf("Get key for token in etcd: fqdn: %s", fqdn)
-	tokenOriginPath := e.tokenOriginPath(fqdn)
-	resp, err := e.kapi.Get(context.Background(), tokenOriginPath, nil)
-	if err != nil {
-		return "", err
-	}
-
-	origin := resp.Node.Value
-	logrus.Debugf("The token origin is %s", origin)
-
-	return origin, nil
-}
-
-// convertToPath
-// zhibo.test.rancher.local => /local/rancher/test/zhibo
+// Used to convert domain to a path as etcd preferred
+// e.g. sample.lb.rancher.cloud => /cloud/rancher/lb/sample
 func convertToPath(domain string) string {
 	ss := strings.Split(domain, ".")
-
 	last := len(ss) - 1
 	for i := 0; i < len(ss)/2; i++ {
 		ss[i], ss[last-i] = ss[last-i], ss[i]
 	}
-
 	return "/" + strings.Join(ss, "/")
 }
 
-// convertToMap
-// source data: {"host":"1.1.1.1"}
-func convertToMap(value string) (map[string]string, error) {
+func unmarshalToMap(b []byte) (map[string]string, error) {
 	var v map[string]string
-	err := json.Unmarshal([]byte(value), &v)
+	err := json.Unmarshal(b, &v)
 	return v, err
-}
-
-// formatValue
-// 1.1.1.1 => {"host": "1.1.1.1"}
-func formatValue(value string) string {
-	return fmt.Sprintf("{\"%s\":\"%s\"}", ValueHostKey, value)
-}
-
-func formatTextValue(value string) string {
-	return fmt.Sprintf("{\"%s\":\"%s\"}", ValueTextKey, value)
-}
-
-// formatKey
-// 1.1.1.1 => 1_1_1_1
-// abcdef.lb.rancher.cloud => abcdef_lb_rancher_cloud
-func formatKey(key string) string {
-	return strings.Replace(key, ".", "_", -1)
 }
 
 func sliceToMap(ss []string) map[string]bool {
@@ -705,27 +497,4 @@ func sliceToMap(ss []string) map[string]bool {
 		m[s] = true
 	}
 	return m
-}
-
-// generateSlug will generate a random slug to be used as shorten link.
-func generateSlug() string {
-	return util.RandStringWithSmall(slugLength)
-}
-
-func generateTokenOrigin() string {
-	return util.RandStringWithAll(tokenOriginLength)
-}
-
-func nodesToStringSlice(nodes client.Nodes) []string {
-	var keys []string
-
-	for _, node := range nodes {
-		keys = append(keys, node.Key)
-
-		for _, key := range nodesToStringSlice(node.Nodes) {
-			keys = append(keys, key)
-		}
-	}
-
-	return keys
 }
