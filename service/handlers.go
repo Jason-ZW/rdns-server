@@ -85,7 +85,7 @@ func createDomain(w http.ResponseWriter, r *http.Request) {
 	}
 
 	b := backend.GetBackend()
-	d, err := b.Create(opts)
+	d, err := b.Set(opts)
 	if err != nil {
 		returnHTTPError(w, http.StatusInternalServerError, err)
 		return
@@ -168,7 +168,7 @@ func createDomainText(w http.ResponseWriter, r *http.Request) {
 	opts.Fqdn = fqdn
 
 	b := backend.GetBackend()
-	d, err := b.CreateText(opts)
+	d, err := b.SetText(opts)
 	if err != nil {
 		returnHTTPError(w, http.StatusInternalServerError, err)
 		return

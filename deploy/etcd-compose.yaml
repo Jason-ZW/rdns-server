@@ -2,7 +2,7 @@ version: '2'
 
 services:
   etcd:
-    image: gcr.io/etcd-development/etcd:v3.2.18
+    image: gcr.io/etcd-development/etcd:v3.3.13
     volumes:
     - /mnt/data/etcd:/etcd-data
     restart: always

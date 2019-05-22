@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#backup flag
+#backup command
 #example
 #https://s3.us-east-2.amazonaws.com/rdns-etcd-bp/rdnsdb-etcd-backup-v2-2018-05-17T08-58-28.tar.gz
 #https://s3.us-east-2.amazonaws.com/rdns-etcd-bp/rdnsdb-etcd-backup-v3-2018-05-17T08-58-29.db.tar.gz

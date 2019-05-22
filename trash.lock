@@ -1,0 +1,30 @@
+package: github.com/rancher/rdns-server
+import:
+- package: github.com/coreos/etcd
+  version: v3.3.13
+- package: github.com/gogo/protobuf
+  version: v0.5
+- package: github.com/golang/protobuf
+  version: 1e59b77b52bf8e4b449a57e6f79f21226d571845
+- package: github.com/gorilla/context
+  version: v1.1
+- package: github.com/gorilla/mux
+  version: v1.6.1
+- package: github.com/pkg/errors
+  version: v0.8.0-1-g839d9e9
+- package: github.com/sirupsen/logrus
+  version: v1.0.5
+- package: github.com/urfave/cli
+  version: v1.20.0
+- package: golang.org/x/crypto
+  version: 9419663f5a44be8b34ca85f08abc5fe1be11f8a3
+- package: golang.org/x/net
+  version: 66aacef3dd8a676686c7ae3716979581e8b03c47
+- package: golang.org/x/sys
+  version: ebfc5b4631820b793c9010c87fd8fef0f39eb082
+- package: golang.org/x/text
+  version: b19bf474d317b857955b12035d2c5acb57ce8b01
+- package: google.golang.org/genproto
+  version: 09f6ed296fc66555a25fe4ce95173148778dfa85
+- package: google.golang.org/grpc
+  version: v1.7.5
