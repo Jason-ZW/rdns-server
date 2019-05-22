@@ -9,16 +9,17 @@ import (
 var currentBackend Backend
 
 type Backend interface {
-	Get(dopts *model.DomainOptions) (model.Domain, error)
-	Create(dopts *model.DomainOptions) (model.Domain, error)
-	Update(dopts *model.DomainOptions) (model.Domain, error)
-	Delete(dopts *model.DomainOptions) error
-	Renew(dopts *model.DomainOptions) (model.Domain, error)
-	CreateText(dopts *model.DomainOptions) (model.Domain, error)
-	GetText(dopts *model.DomainOptions) (model.Domain, error)
-	UpdateText(dopts *model.DomainOptions) (model.Domain, error)
-	DeleteText(dopts *model.DomainOptions) error
-	GetTokenOrigin(fqdn string) (string, error)
+	Get(opts *model.DomainOptions) (model.Domain, error)
+	Set(opts *model.DomainOptions) (model.Domain, error)
+	Update(opts *model.DomainOptions) (model.Domain, error)
+	Delete(opts *model.DomainOptions) error
+	Renew(opts *model.DomainOptions) (model.Domain, error)
+	SetText(opts *model.DomainOptions) (model.Domain, error)
+	GetText(opts *model.DomainOptions) (model.Domain, error)
+	UpdateText(opts *model.DomainOptions) (model.Domain, error)
+	DeleteText(opts *model.DomainOptions) error
+	GetToken(fqdn string) (string, error)
+	GetZone() string
 }
 
 func SetBackend(b Backend) {
@@ -27,7 +28,7 @@ func SetBackend(b Backend) {
 
 func GetBackend() Backend {
 	if currentBackend == nil {
-		logrus.Fatal("Not found any backend")
+		logrus.Fatal("not found any backend")
 	}
 	return currentBackend
 }

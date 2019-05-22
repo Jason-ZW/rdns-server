@@ -26,7 +26,7 @@ func getBaseFqdn(fqdn string) string {
 
 func generateToken(fqdn string) (string, error) {
 	b := backend.GetBackend()
-	origin, err := b.GetTokenOrigin(fqdn)
+	origin, err := b.GetToken(fqdn)
 	if err != nil {
 		logrus.Errorf("Failed to get token origin %s, err: %v", fqdn, err)
 		return "", err
@@ -44,7 +44,7 @@ func generateToken(fqdn string) (string, error) {
 func compareToken(fqdn, token string) bool {
 	// normal text record & acme text record need special treatment
 	fqdnLen := len(strings.Split(fqdn, "."))
-	rootDomainLen := len(strings.Split(rootDomain, "."))
+	rootDomainLen := len(strings.Split(backend.GetBackend().GetZone(), "."))
 	diffLen := fqdnLen - rootDomainLen
 	if diffLen > 1 {
 		sp := strings.SplitAfterN(fqdn, ".", diffLen)
@@ -58,7 +58,7 @@ func compareToken(fqdn, token string) bool {
 	}
 
 	b := backend.GetBackend()
-	origin, err := b.GetTokenOrigin(fqdn)
+	origin, err := b.GetToken(fqdn)
 	if err != nil {
 		logrus.Errorf("Failed to get token origin %s, err: %v", fqdn, err)
 		return false
@@ -78,10 +78,10 @@ func compareToken(fqdn, token string) bool {
 
 func tokenMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// createDomain and ping have no need to check token
+		// createDomain and ping and metrics have no need to check token
 		logrus.Debugf("Request URL path: %s", r.URL.Path)
 		if (r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/txt")) ||
-			(r.Method != http.MethodPost && !strings.HasPrefix(r.URL.Path, "/ping")) {
+			(r.Method != http.MethodPost && !strings.HasPrefix(r.URL.Path, "/ping") && !strings.HasPrefix(r.URL.Path, "/metrics")) {
 			authorization := r.Header.Get("Authorization")
 			token := strings.TrimLeft(authorization, "Bearer ")
 			fqdn, ok := mux.Vars(r)["fqdn"]
