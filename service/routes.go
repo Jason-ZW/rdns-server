@@ -4,6 +4,8 @@ import (
 	"net/http"
 
 	"github.com/gorilla/mux"
+	_ "github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 )
 
@@ -78,6 +80,12 @@ var routes = Routes{
 		"DELETE",
 		"/v1/domain/{fqdn}/txt",
 		deleteDomainText,
+	},
+	Route{
+		"metrics",
+		"GET",
+		"/metrics",
+		promhttp.Handler(),
 	},
 }
 
