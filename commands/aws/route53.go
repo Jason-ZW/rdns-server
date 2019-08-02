@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/rancher/rdns-server/commands/global"
+	"github.com/rancher/rdns-server/keepers"
 	"github.com/rancher/rdns-server/providers"
 	"github.com/rancher/rdns-server/providers/aws"
 	"github.com/rancher/rdns-server/routers"
@@ -22,6 +23,8 @@ var (
 		"AWS_ASSUME_ROLE":       {"aws assume role.": ""},
 		"AWS_RETRY":             {"aws retry times.": "3"},
 		"TTL":                   {"route53 record ttl.": "60"},
+		"DB_MIGRATE":            {"database migrate operation, options (up, down, none).": "none"},
+		"DB_DSN":                {"database source name.": ""},
 	}
 )
 
@@ -48,6 +51,12 @@ func Action(c *cli.Context) error {
 
 	provider := aws.NewR53Provider()
 	providers.SetProvider(provider)
+
+	defer func() {
+		if err := keepers.GetKeeper().Close(); err != nil {
+			logrus.Errorf("failed to close keeper: %s\n", err.Error())
+		}
+	}()
 
 	done := make(chan struct{})
 	routers.NewRouter(done)

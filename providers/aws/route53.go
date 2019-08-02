@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	"github.com/rancher/rdns-server/keepers"
-	awsKeeper "github.com/rancher/rdns-server/keepers/aws"
+	"github.com/rancher/rdns-server/keepers/rds"
 	"github.com/rancher/rdns-server/types"
 	"github.com/rancher/rdns-server/utils"
 
@@ -16,11 +16,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/route53"
-	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 const (
+	dnsLogKey        = "dns"
 	providerName     = "route53"
 	maxSlugHashTimes = 100
 	slugLength       = 6
@@ -81,7 +81,7 @@ func NewR53Provider() *R53Provider {
 	}
 
 	// initialize keeper which maintain concept information.
-	keeper := awsKeeper.NewRout53Keeper(r53, zoneName, zoneID, ttl)
+	keeper := rds.NewRDS(zoneName, ttl)
 	keepers.SetKeeper(keeper)
 
 	return &R53Provider{
@@ -113,7 +113,7 @@ func (p *R53Provider) List() (types.Result, error) {
 	}
 
 	f := func(rrs *route53.ListResourceRecordSetsOutput, last bool) (isContinue bool) {
-		results := assembleResults(rrs.ResourceRecordSets, "", true)
+		results := combinedResults(rrs.ResourceRecordSets, "", true)
 
 		// append result sets to output.
 		output.Records = append(output.Records, results...)
@@ -127,7 +127,7 @@ func (p *R53Provider) List() (types.Result, error) {
 	}
 
 	if err := p.client.ListResourceRecordSetsPages(params, f); err != nil {
-		logrus.WithError(err).Debugln("list route53 record(s) failed")
+		logrus.Debugln(err)
 		return output, err
 	}
 
@@ -136,399 +136,177 @@ func (p *R53Provider) List() (types.Result, error) {
 
 // Get return relevant records based on key information.
 func (p *R53Provider) Get(payload types.Payload) (types.Result, error) {
+	rrs, err := p.get(payload.Type, payload.Domain)
+	if err != nil {
+		logrus.WithField(dnsLogKey, toDNSLogKey(payload)).Debugln(err)
+		return types.Result{}, err
+	}
+
+	rs := p.filterRecords(rrs, payload)
+
 	output := types.Result{
 		Domain:   payload.Domain,
 		Type:     payload.Type,
 		Wildcard: payload.Wildcard,
-		Records:  []types.ResultRecord{},
+		Records:  combinedResults(rs, payload.Domain, false),
 	}
-
-	params := &route53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(p.zoneID),
-		StartRecordType: aws.String(payload.Type),
-		StartRecordName: aws.String(payload.Domain),
-	}
-
-	rrs, err := p.getMatchesRecordSets(params, payload)
-	if err != nil {
-		logrus.WithError(err).Debugf("get route53 matches record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-		return output, err
-	}
-
-	results := assembleResults(rrs.ResourceRecordSets, payload.Domain, false)
-
-	// append result sets to output.
-	output.Records = append(output.Records, results...)
-
-	// get token & expire from ownership-keeper TXT record which keep domain ownership concept.
-	ownership, err := p.keeper.GetOwnership(payload.Type, payload.Domain)
-	if err != nil {
-		logrus.Debug(err)
-		return output, err
-	}
-
-	if len(output.Records) != 1 {
-		logrus.WithError(err).Debugf("found multi record(s): %s (%s)\n", payload.Domain, payload.Type)
-		return output, errors.New("found multi record(s)")
-	}
-
-	output.Records[0].Token = ownership.Token
-	output.Records[0].Expire = ownership.Expire
 
 	return output, nil
 }
 
 // Post create supported records.
 func (p *R53Provider) Post(payload types.Payload) (types.Result, error) {
-	output := types.Result{
-		Domain:   payload.Domain,
-		Type:     payload.Type,
-		Wildcard: payload.Wildcard,
-		Records:  []types.ResultRecord{},
-	}
+	//changes := make([]*route53.Change, 0)
 
-	// generate random DNS names.
+	// generate random DNS name.
 	if payload.Domain == "" {
 		for i := 0; i < maxSlugHashTimes; i++ {
-			payload.Domain = utils.RandStringWithSmall(slugLength) + "." + p.zoneName
-			if payload.Wildcard {
-				payload.Domain = "*" + "." + payload.Domain
-			}
+			prefix := utils.RandStringWithSmall(slugLength)
 
-			// check rotate-keeper record to determine whether the name is available.
-			canUse, err := p.keeper.NameCanUse(payload.Type, payload.Domain)
+			// check if the name is available.
+			canUse, err := p.keeper.PrefixCanBeUsed(prefix)
 			if !canUse || err != nil {
 				continue
 			}
 
-			_, err = p.keeper.SetRotate(payload.Type, payload.Domain)
-			if err != nil {
-				logrus.Debug(err)
-				return output, err
+			payload.Domain = prefix + "." + p.zoneName
+
+			// if wildcard, need add a "*" as prefix.
+			if payload.Wildcard {
+				payload.Domain = "*" + "." + payload.Domain
 			}
 
 			break
 		}
 	}
 
-	// set ownership-keeper TXT record which keep domain ownership concept.
-	ownership, err := p.keeper.SetOwnership(payload.Type, payload.Domain)
-	if err != nil {
-		logrus.Debug(err)
-		return output, err
-	}
-
-	params := &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(p.zoneID),
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: []*route53.Change{},
-		},
-	}
-
-	rr := make([]*route53.ResourceRecord, 0)
-
-	// set sub-domain ownership-keeper TXT record which keep sub-domain ownership concept.
-	for k, v := range payload.SubDomains {
-		sn := strings.ToLower(k) + "." + utils.GetDNSRootName(payload.Domain, payload.Wildcard)
-		err := p.keeper.SetSubOwnership(payload.Type, sn, ownership)
-		if err != nil {
-			logrus.Debug(err)
-			return output, err
-		}
-		// set sub-domain records.
-		srr := make([]*route53.ResourceRecord, 0)
-
-		sv := strings.Split(v, ",")
-		for _, vv := range sv {
-			if payload.Type == types.RecordTypeTXT {
-				vv = utils.TextWithQuotes(vv)
-			}
-			srr = append(srr, &route53.ResourceRecord{Value: aws.String(vv)})
-		}
-
-		params = p.batchChanges(params, route53.ChangeActionUpsert, payload.Type, sn, p.ttl, srr)
-	}
-
-	// set domain records.
-	values := strings.Split(payload.Value, ",")
-	for _, v := range values {
-		if payload.Type == types.RecordTypeTXT {
-			v = utils.TextWithQuotes(v)
-		}
-		rr = append(rr, &route53.ResourceRecord{Value: aws.String(v)})
-	}
-
-	params = p.batchChanges(params, route53.ChangeActionUpsert, payload.Type, payload.Domain, p.ttl, rr)
-
-	_, err = p.client.ChangeResourceRecordSets(params)
-	if err != nil {
-		logrus.WithError(err).Debugf("set route53 record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-		return output, err
-	}
+	//
+	//// set rotate record, record this name cannot be used again.
+	//changes = append(changes, p.keeper.SetRotate(payload.Type, payload.Domain).(*route53.Change))
+	//
+	//// processing domain records.
+	//rr := stringToResourceRecord(payload.Type, payload.Value)
+	//changes = append(changes, p.addChange(route53.ChangeActionUpsert, payload.Type, payload.Domain, rr)...)
+	//
+	//// set ownership record which keep domain ownership concept.
+	//ownership, err := p.keeper.SetOwnership(payload.Type, payload.Domain)
+	//if err != nil {
+	//	logrus.WithField(dnsLogKey, toDNSLogKey(payload)).Debug(err)
+	//	return types.Result{}, err
+	//}
+	//
+	//// processing sub-domain records.
+	//for k, v := range payload.SubDomains {
+	//	subName := strings.ToLower(k) + "." + utils.GetDNSRootName(payload.Domain, payload.Wildcard)
+	//
+	//	// set sub-domain ownership record which keep sub-domain ownership concept.
+	//	changes = append(changes, p.keeper.SetSubDomainOwnership(payload.Type, subName, ownership).(*route53.Change))
+	//
+	//	srr := make([]*route53.ResourceRecord, 0)
+	//	srr = append(srr, stringToResourceRecord(payload.Type, v)...)
+	//
+	//	// set sub-domain record.
+	//	changes = append(changes, p.addChange(route53.ChangeActionUpsert, payload.Type, subName, srr)...)
+	//}
+	//
+	//// submit changes to route53.
+	//if err := p.submitChanges(changes); err != nil {
+	//	logrus.WithField(dnsLogKey, toDNSLogKey(payload)).Debug(err)
+	//	return types.Result{}, err
+	//}
 
 	return p.Get(payload)
 }
 
 // Put update supported records.
 func (p *R53Provider) Put(payload types.Payload) (types.Result, error) {
-	params := &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(p.zoneID),
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: []*route53.Change{},
-		},
-	}
-
-	origin, err := p.Get(payload)
-	if err != nil {
-		return types.Result{}, err
-	}
-
-	if len(origin.Records) < 1 {
-		logrus.Debugf("no exist record(s): %s (%s)\n", payload.Domain, payload.Type)
-		return types.Result{}, err
-	}
-
-	// add the matched records to changeBatch.
-	if origin.Records[0].Value != payload.Value {
-		rr := make([]*route53.ResourceRecord, 0)
-
-		values := strings.Split(payload.Value, ",")
-		for _, v := range values {
-			if payload.Type == types.RecordTypeTXT {
-				v = utils.TextWithQuotes(v)
-			}
-			rr = append(rr, &route53.ResourceRecord{Value: aws.String(v)})
-		}
-
-		params = p.batchChanges(params, route53.ChangeActionUpsert, payload.Type, payload.Domain, p.ttl, rr)
-	}
-
-	for _, r := range origin.Records {
-		if !utils.IsSupportedType(r.Type) || r.Type != payload.Type || r.Domain != payload.Domain {
-			continue
-		}
-		for k, vv := range r.SubDomains {
-			if sv, ok := payload.SubDomains[k]; ok {
-				if sv == vv {
-					// no need to handle.
-					continue
-				}
-
-				// add the matched sub-domain records which need to be updated to changeBatch.
-				srr := make([]*route53.ResourceRecord, 0)
-
-				values := strings.Split(sv, ",")
-				for _, v := range values {
-					if payload.Type == types.RecordTypeTXT {
-						v = utils.TextWithQuotes(v)
-					}
-					srr = append(srr, &route53.ResourceRecord{Value: aws.String(v)})
-				}
-
-				params = p.batchChanges(params, route53.ChangeActionUpsert, payload.Type, k+"."+payload.Domain, p.ttl, srr)
-			} else {
-				// add the matched sub-domain records which need to be deleted to changeBatch.
-				srr := make([]*route53.ResourceRecord, 0)
-
-				values := strings.Split(vv, ",")
-				for _, v := range values {
-					if payload.Type == types.RecordTypeTXT {
-						v = utils.TextWithQuotes(v)
-					}
-					srr = append(srr, &route53.ResourceRecord{Value: aws.String(v)})
-				}
-
-				params = p.batchChanges(params, route53.ChangeActionDelete, payload.Type, k+"."+payload.Domain, p.ttl, srr)
-
-				// delete sub-domain ownership-keeper TXT record which keep ownership concept.
-				if err := p.keeper.DeleteOwnership(payload.Type, k+"."+payload.Domain); err != nil {
-					logrus.Debug(err)
-					return types.Result{}, err
-				}
-			}
-		}
-		for k, vv := range payload.SubDomains {
-			if _, ok := r.SubDomains[k]; !ok {
-				// add sub-domain records to changeBatch.
-				srr := make([]*route53.ResourceRecord, 0)
-
-				values := strings.Split(vv, ",")
-				for _, v := range values {
-					if payload.Type == types.RecordTypeTXT {
-						v = utils.TextWithQuotes(v)
-					}
-					srr = append(srr, &route53.ResourceRecord{Value: aws.String(v)})
-				}
-
-				params = p.batchChanges(params, route53.ChangeActionUpsert, payload.Type, k+"."+payload.Domain, p.ttl, srr)
-
-				// set sub-domain ownership-keeper TXT record which keep ownership concept.
-				ownership, err := p.keeper.GetOwnership(payload.Type, payload.Domain)
-				if err != nil {
-					logrus.Debug(err)
-					return types.Result{}, err
-				}
-				if err := p.keeper.SetSubOwnership(payload.Type, k+"."+payload.Domain, ownership); err != nil {
-					logrus.Debug(err)
-					return types.Result{}, err
-				}
-			}
-		}
-	}
-
-	if len(params.ChangeBatch.Changes) > 0 {
-		_, err = p.client.ChangeResourceRecordSets(params)
-		if err != nil {
-			logrus.WithError(err).Debugf("update route53 record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-			return types.Result{}, err
-		}
-	}
-
-	return p.Get(payload)
+	return types.Result{}, nil
 }
 
 // Delete delete supported records.
 func (p *R53Provider) Delete(payload types.Payload) (types.Result, error) {
-	output := types.Result{
-		Domain:   payload.Domain,
-		Type:     payload.Type,
-		Wildcard: payload.Wildcard,
-	}
-
-	params := &route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(p.zoneID),
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: []*route53.Change{},
-		},
-	}
-
-	rrs, err := p.getMatchesRecordSets(&route53.ListResourceRecordSetsInput{
-		HostedZoneId:    aws.String(p.zoneID),
-		StartRecordType: aws.String(payload.Type),
-		StartRecordName: aws.String(payload.Domain),
-	}, payload)
-	if err != nil {
-		logrus.WithError(err).Debugf("get route53 matches record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-		return output, err
-	}
-
-	rr := make([]*route53.ResourceRecord, 0)
-
-	for _, rs := range rrs.ResourceRecordSets {
-		dnsType := aws.StringValue(rs.Type)
-		dnsName := utils.GetDNSName(aws.StringValue(rs.Name))
-
-		if !utils.IsSupportedType(dnsType) {
-			continue
-		}
-
-		if dnsType == payload.Type {
-			if dnsName == payload.Domain {
-				// add matched records to changeBatch.
-				rr = append(rr, rs.ResourceRecords...)
-				// delete ownership-keeper TXT record which keep ownership concept.
-				// just print error, no need to handle.
-				if err := p.keeper.DeleteOwnership(dnsType, dnsName); err != nil {
-					logrus.Debug(err)
-				}
-				continue
-			}
-
-			if keepers.GetKeeper().IsSubDomain(dnsType, dnsName, payload.Type, utils.GetDNSRootName(payload.Domain, payload.Wildcard)) {
-				// add matched sub-domain records to changeBatch.
-				params = p.batchChanges(params, route53.ChangeActionDelete, payload.Type, dnsName, p.ttl, rs.ResourceRecords)
-				// delete ownership-keeper TXT record which keep ownership concept.
-				// just print error, no need to handle.
-				if err := p.keeper.DeleteOwnership(dnsType, dnsName); err != nil {
-					logrus.Debug(err)
-				}
-			}
-		}
-	}
-
-	params = p.batchChanges(params, route53.ChangeActionDelete, payload.Type, payload.Domain, p.ttl, rr)
-
-	_, err = p.client.ChangeResourceRecordSets(params)
-	if err != nil {
-		logrus.WithError(err).Debugf("delete route53 record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-		return output, err
-	}
-
-	return output, nil
+	return types.Result{}, nil
 }
 
 // Renew renew supported records, this only renew records which has prefix with txt-keeper-.
 func (p *R53Provider) Renew(payload types.Payload) (types.Result, error) {
-	ownership, err := p.keeper.GetOwnership(payload.Type, payload.Domain)
-	if err != nil {
-		logrus.Debug(err)
-		return types.Result{}, err
-	}
-
-	if ownership.Domain != keepers.DNSNameToOwnership(payload.Type, payload.Domain) {
-		logrus.Debugf("sub-domain can not be renewed: %s (%s)\n", payload.Domain, payload.Type)
-		return types.Result{}, err
-	}
-
-	records, err := p.Get(payload)
-	if err != nil {
-		return types.Result{}, err
-	}
-
-	for _, rs := range records.Records {
-		// renew matched records.
-		renew, err := p.keeper.RenewOwnership(rs.Type, rs.Domain, ownership)
-		if err != nil {
-			logrus.Debug(err)
-			return types.Result{}, err
-		}
-
-		// renew matched sub-domain records.
-		for k := range rs.SubDomains {
-			if err := p.keeper.SetSubOwnership(rs.Type, k+"."+payload.Domain, renew); err != nil {
-				logrus.Debug(err)
-				return types.Result{}, err
-			}
-		}
-	}
-
-	return p.Get(payload)
+	return types.Result{}, nil
 }
 
-// batchChanges append route53.Change to ChangeResourceRecordSetsInput.ChangeBatch.Changes.
-func (p *R53Provider) batchChanges(params *route53.ChangeResourceRecordSetsInput, action, dnsType, dnsName string, ttl int64, rr []*route53.ResourceRecord) *route53.ChangeResourceRecordSetsInput {
+// submitChanges submit changes to route53.
+func (p *R53Provider) submitChanges(changes []*route53.Change) error {
+	_, err := p.client.ChangeResourceRecordSets(&route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(p.zoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: changes,
+		},
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// addChange add *route53.Change to []*route53.Change.
+func (p *R53Provider) addChange(action, dnsType, dnsName string, rr []*route53.ResourceRecord) []*route53.Change {
+	changes := make([]*route53.Change, 0)
 	change := &route53.Change{
 		Action: aws.String(action),
 		ResourceRecordSet: &route53.ResourceRecordSet{
-			TTL:             aws.Int64(ttl),
+			TTL:             aws.Int64(p.ttl),
 			Type:            aws.String(dnsType),
 			Name:            aws.String(utils.WildcardUnescape(dnsName)),
 			ResourceRecords: rr,
 		},
 	}
-
-	params.ChangeBatch.Changes = append(params.ChangeBatch.Changes, change)
-
-	return params
+	changes = append(changes, change)
+	return changes
 }
 
-// getMatchesRecordSets returns all matches records.
-func (p *R53Provider) getMatchesRecordSets(params *route53.ListResourceRecordSetsInput, payload types.Payload) (*route53.ListResourceRecordSetsOutput, error) {
-	// returns up to 100 resource record sets at a time in ASCII order.
-	// queries outside of more than 100 record sets are not supported.
-	rrs, err := p.client.ListResourceRecordSets(params)
-	if err != nil {
-		logrus.WithError(err).Errorf("get route53 record(s) failed: %s (%s)\n", payload.Domain, payload.Type)
-		return rrs, errors.New("get route53 record(s) failed")
+// get returns route53.ListResourceRecordSetsOutput by dnsName & dnsType
+func (p *R53Provider) get(dnsType, dnsName string) (*route53.ListResourceRecordSetsOutput, error) {
+	params := &route53.ListResourceRecordSetsInput{
+		HostedZoneId:    aws.String(p.zoneID),
+		StartRecordType: aws.String(dnsType),
+		StartRecordName: aws.String(dnsName),
 	}
 
-	rrs.ResourceRecordSets = filter(rrs.ResourceRecordSets, payload)
-
-	return rrs, nil
+	// returns up to 100 resource record sets at a time in ASCII order.
+	// queries outside of more than 100 record sets are not supported.
+	return p.client.ListResourceRecordSets(params)
 }
 
-// assembleResults assemble and convert output format to rdns-server preferred.
-func assembleResults(rrs []*route53.ResourceRecordSet, parentName string, isList bool) []types.ResultRecord {
+// filterRecords returns valid records and sub-domain records.
+func (p *R53Provider) filterRecords(rrs *route53.ListResourceRecordSetsOutput, payload types.Payload) []*route53.ResourceRecordSet {
+	output := make([]*route53.ResourceRecordSet, 0)
+
+	for _, rs := range rrs.ResourceRecordSets {
+		rsType := aws.StringValue(rs.Type)
+		rsName := utils.GetDNSName(aws.StringValue(rs.Name))
+
+		if !strings.Contains(rsName, payload.Domain) {
+			continue
+		}
+
+		if rsType == payload.Type {
+			if rsName == payload.Domain {
+				output = append(output, rs)
+				continue
+			}
+
+			// TODO: sub-domain logic will be considered.
+			// if it is sub-domain then added it to the output.
+			//parentType := payload.Type
+			//parentName := utils.GetDNSRootName(payload.Domain, payload.Wildcard)
+
+		}
+	}
+
+	return output
+}
+
+// combinedResults combine []*route53.ResourceRecordSet results to rdns-server preferred.
+func combinedResults(rrs []*route53.ResourceRecordSet, parentName string, isList bool) []types.ResultRecord {
 	output := make([]types.ResultRecord, 0)
 	kvs := make(map[string]types.ResultRecord, 0)
 
@@ -549,12 +327,12 @@ func assembleResults(rrs []*route53.ResourceRecordSet, parentName string, isList
 			key = fmt.Sprintf("%s-%s", dnsType, parentName)
 			key = strings.ToLower(key)
 			prefix := strings.Split(dnsName, ".")[0]
-			kvs[key].SubDomains[prefix] = valueToString(rs.ResourceRecords, dnsType)
+			kvs[key].SubDomains[prefix] = valuesToString(rs.ResourceRecords, dnsType)
 			continue
 		}
 
 		if v, ok := kvs[key]; ok {
-			v.Value = v.Value + "," + valueToString(rs.ResourceRecords, dnsType)
+			v.Value = v.Value + "," + valuesToString(rs.ResourceRecords, dnsType)
 			v.Value = strings.Trim(v.Value, ",")
 			kvs[key] = v
 			continue
@@ -563,7 +341,7 @@ func assembleResults(rrs []*route53.ResourceRecordSet, parentName string, isList
 		r := types.ResultRecord{
 			Domain:     dnsName,
 			Type:       dnsType,
-			Value:      valueToString(rs.ResourceRecords, dnsType),
+			Value:      valuesToString(rs.ResourceRecords, dnsType),
 			SubDomains: map[string]string{},
 		}
 		kvs[key] = r
@@ -576,9 +354,9 @@ func assembleResults(rrs []*route53.ResourceRecordSet, parentName string, isList
 	return output
 }
 
-// valueToString returns dns string value.
+// valuesToString returns dns string value.
 // See: https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/ResourceRecordTypes.html
-func valueToString(rr []*route53.ResourceRecord, dnsType string) string {
+func valuesToString(rr []*route53.ResourceRecord, dnsType string) string {
 	multiValue := ""
 
 	switch dnsType {
@@ -594,29 +372,20 @@ func valueToString(rr []*route53.ResourceRecord, dnsType string) string {
 	return strings.TrimRight(multiValue, ",")
 }
 
-// filter returns the set of records that meet the criteria.
-func filter(rrs []*route53.ResourceRecordSet, payload types.Payload) []*route53.ResourceRecordSet {
-	output := make([]*route53.ResourceRecordSet, 0)
-
-	for _, rs := range rrs {
-		dnsType := aws.StringValue(rs.Type)
-		dnsName := utils.GetDNSName(aws.StringValue(rs.Name))
-
-		if strings.HasPrefix(dnsName, keepers.RotatePrefix) || strings.HasPrefix(dnsName, keepers.OwnershipPrefix) || !strings.Contains(dnsName, payload.Domain) {
-			continue
+// stringToResourceRecord returns []*route53.ResourceRecord.
+func stringToResourceRecord(dnsType, value string) []*route53.ResourceRecord {
+	rr := make([]*route53.ResourceRecord, 0)
+	values := strings.Split(value, ",")
+	for _, v := range values {
+		if dnsType == types.RecordTypeTXT {
+			v = utils.TextWithQuotes(v)
 		}
-
-		if dnsType == payload.Type {
-			if dnsName == payload.Domain {
-				output = append(output, rs)
-				continue
-			}
-			// add sub-domain record if exist and valid.
-			if keepers.GetKeeper().IsSubDomain(dnsType, dnsName, payload.Type, utils.GetDNSRootName(payload.Domain, payload.Wildcard)) {
-				output = append(output, rs)
-			}
-		}
+		rr = append(rr, &route53.ResourceRecord{Value: aws.String(v)})
 	}
+	return rr
+}
 
-	return output
+// toDNSLogKey returns logrus.Field key.
+func toDNSLogKey(payload types.Payload) string {
+	return fmt.Sprintf("%s (%s)", payload.Domain, payload.Type)
 }
