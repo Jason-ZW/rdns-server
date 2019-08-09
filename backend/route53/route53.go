@@ -183,6 +183,13 @@ func (b *Backend) Set(opts *model.DomainOptions) (d model.Domain, err error) {
 	}
 
 	// set empty A record, sometimes we need to hold domain records although domain has no hosts value
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
+
 	rrs := &route53.ResourceRecordSet{
 		Type: aws.String(typeA),
 		Name: aws.String(fmt.Sprintf("empty.%s", opts.Fqdn)),
@@ -207,12 +214,12 @@ func (b *Backend) Set(opts *model.DomainOptions) (d model.Domain, err error) {
 	}
 	rrs.Name = aws.String(opts.Fqdn)
 	rrs.ResourceRecords = rr
-	if _, err := b.setRecord(rrs, opts, typeA, tID, pID, false); err != nil {
+	if _, err := b.setRecord(input, rrs, opts, typeA, tID, pID, false); err != nil {
 		return d, err
 	}
 
 	rrs.Name = aws.String(fmt.Sprintf("\\052.%s", opts.Fqdn))
-	if _, err := b.setRecord(rrs, opts, typeA, tID, pID, false); err != nil {
+	if _, err := b.setRecord(input, rrs, opts, typeA, tID, pID, false); err != nil {
 		return d, err
 	}
 
@@ -232,9 +239,13 @@ func (b *Backend) Set(opts *model.DomainOptions) (d model.Domain, err error) {
 			TTL:             aws.Int64(int64(b.TTL)),
 		}
 
-		if _, err := b.setRecord(rrs, opts, typeA, tID, pID, true); err != nil {
+		if _, err := b.setRecord(input, rrs, opts, typeA, tID, pID, true); err != nil {
 			return d, err
 		}
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return d, errors.Wrapf(err, errUpsertRoute53Record, typeA, opts.Fqdn)
 	}
 
 	return b.Get(opts)
@@ -252,6 +263,13 @@ func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) 
 
 	// convert A & sub domain records to map
 	as, cs := b.convertARecords(a, s)
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
 
 	rr := make([]*route53.ResourceRecord, 0)
 	for _, h := range opts.Hosts {
@@ -273,11 +291,11 @@ func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) 
 	}
 
 	// update A and wildcard A records
-	if _, err := b.setRecord(rrs, opts, typeA, e.TID, e.ID, false); err != nil {
+	if _, err := b.setRecord(input, rrs, opts, typeA, e.TID, e.ID, false); err != nil {
 		return d, err
 	}
 	rrs.Name = aws.String(fmt.Sprintf("\\052.%s", opts.Fqdn))
-	if _, err := b.setRecord(rrs, opts, typeA, e.TID, e.ID, false); err != nil {
+	if _, err := b.setRecord(input, rrs, opts, typeA, e.TID, e.ID, false); err != nil {
 		return d, err
 	}
 
@@ -297,7 +315,7 @@ func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) 
 			TTL:             aws.Int64(int64(b.TTL)),
 		}
 
-		if _, err := b.setRecord(rrs, opts, typeA, e.TID, e.ID, true); err != nil {
+		if _, err := b.setRecord(input, rrs, opts, typeA, e.TID, e.ID, true); err != nil {
 			return d, err
 		}
 	}
@@ -320,11 +338,11 @@ func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) 
 				TTL:             aws.Int64(int64(b.TTL)),
 			}
 
-			if err := b.deleteRecord(rrs, opts, typeA, true); err != nil {
+			if err := b.deleteRecord(input, rrs, opts, typeA, true); err != nil {
 				return d, err
 			}
 			rrs.Name = aws.String(fmt.Sprintf("\\052.%s", opts.Fqdn))
-			if err := b.deleteRecord(rrs, opts, typeA, true); err != nil {
+			if err := b.deleteRecord(input, rrs, opts, typeA, true); err != nil {
 				return d, err
 			}
 		}
@@ -347,11 +365,15 @@ func (b *Backend) Update(opts *model.DomainOptions) (d model.Domain, err error) 
 				TTL:             aws.Int64(int64(b.TTL)),
 			}
 
-			if err := b.deleteRecord(rrs, opts, typeA, true); err != nil {
+			if err := b.deleteRecord(input, rrs, opts, typeA, true); err != nil {
 				return d, err
 			}
 			continue
 		}
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return d, errors.Wrapf(err, errUpsertRoute53Record, typeA, opts.Fqdn)
 	}
 
 	return b.Get(opts)
@@ -367,9 +389,16 @@ func (b *Backend) Delete(opts *model.DomainOptions) error {
 
 	_, a, s, _ := b.filterRecords(records.ResourceRecordSets, opts, typeA)
 
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
+
 	// delete wildcard A records
 	for _, rr := range a {
-		if err := b.deleteRecord(rr, opts, typeA, false); err != nil {
+		if err := b.deleteRecord(input, rr, opts, typeA, false); err != nil {
 			return err
 		}
 	}
@@ -377,7 +406,7 @@ func (b *Backend) Delete(opts *model.DomainOptions) error {
 	// delete sub domain A records
 	if len(s) > 0 {
 		for _, rr := range s {
-			if err := b.deleteRecord(rr, opts, typeA, true); err != nil {
+			if err := b.deleteRecord(input, rr, opts, typeA, true); err != nil {
 				return err
 			}
 		}
@@ -387,6 +416,10 @@ func (b *Backend) Delete(opts *model.DomainOptions) error {
 	emptyName := fmt.Sprintf("%s.%s", "empty", opts.Fqdn)
 	if err := database.GetDatabase().DeleteA(emptyName); err != nil {
 		return errors.Wrapf(err, errDeleteAFromDatabase, emptyName)
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return errors.Wrapf(err, errDeleteRoute53Record, typeA, opts.Fqdn)
 	}
 
 	return nil
@@ -467,8 +500,19 @@ func (b *Backend) SetText(opts *model.DomainOptions) (d model.Domain, err error)
 		TTL: aws.Int64(int64(b.TTL)),
 	}
 
-	if _, err := b.setRecord(rrs, opts, typeTXT, r.ID, 0, false); err != nil {
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
+
+	if _, err := b.setRecord(input, rrs, opts, typeTXT, r.ID, 0, false); err != nil {
 		return d, err
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return d, errors.Wrapf(err, errUpsertRoute53Record, typeTXT, opts.Fqdn)
 	}
 
 	return b.GetText(opts)
@@ -484,6 +528,13 @@ func (b *Backend) UpdateText(opts *model.DomainOptions) (d model.Domain, err err
 
 	if valid, _, _, _ := b.filterRecords(records.ResourceRecordSets, opts, typeTXT); !valid {
 		return d, errors.Errorf(errFilterRecords, typeTXT, opts.Fqdn)
+	}
+
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
 	}
 
 	r, err := database.GetDatabase().QueryTXT(opts.Fqdn)
@@ -502,7 +553,7 @@ func (b *Backend) UpdateText(opts *model.DomainOptions) (d model.Domain, err err
 		TTL: aws.Int64(int64(b.TTL)),
 	}
 
-	if _, err := b.setRecord(rrs, opts, typeTXT, r.TID, 0, false); err != nil {
+	if _, err := b.setRecord(input, rrs, opts, typeTXT, r.TID, 0, false); err != nil {
 		return d, err
 	}
 
@@ -510,6 +561,10 @@ func (b *Backend) UpdateText(opts *model.DomainOptions) (d model.Domain, err err
 	token, err := database.GetDatabase().QueryToken(b.findSlugWithZone(opts.Fqdn))
 	if err != nil {
 		return d, errors.Wrapf(err, errQueryTokenFromDatabase, opts.Fqdn)
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return d, errors.Wrapf(err, errUpsertRoute53Record, typeTXT, opts.Fqdn)
 	}
 
 	d.Fqdn = opts.Fqdn
@@ -533,10 +588,21 @@ func (b *Backend) DeleteText(opts *model.DomainOptions) error {
 		return errors.Errorf(errFilterRecords, typeTXT, opts.Fqdn)
 	}
 
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
+
 	for _, rr := range t {
-		if err := b.deleteRecord(rr, opts, typeTXT, false); err != nil {
+		if err := b.deleteRecord(input, rr, opts, typeTXT, false); err != nil {
 			return err
 		}
+	}
+
+	if err := b.submitChanges(input); err != nil {
+		return errors.Wrapf(err, errDeleteRoute53Record, typeTXT, opts.Fqdn)
 	}
 
 	return nil
@@ -572,6 +638,13 @@ func (b *Backend) MigrateToken(opts *model.MigrateToken) error {
 }
 
 func (b *Backend) MigrateRecord(opts *model.MigrateRecord) error {
+	input := &route53.ChangeResourceRecordSetsInput{
+		HostedZoneId: aws.String(b.ZoneID),
+		ChangeBatch: &route53.ChangeBatch{
+			Changes: make([]*route53.Change, 0),
+		},
+	}
+
 	if opts.Text != "" {
 		// migrate TXT record
 		dopts := &model.DomainOptions{
@@ -623,12 +696,12 @@ func (b *Backend) MigrateRecord(opts *model.MigrateRecord) error {
 			TTL:             aws.Int64(int64(b.TTL)),
 		}
 
-		if _, err := b.setRecord(rrs, dopts, typeA, t.ID, pID, false); err != nil {
+		if _, err := b.setRecord(input, rrs, dopts, typeA, t.ID, pID, false); err != nil {
 			return err
 		}
 
 		rrs.Name = aws.String(fmt.Sprintf("\\052.%s", dopts.Fqdn))
-		if _, err := b.setRecord(rrs, dopts, typeA, t.ID, pID, false); err != nil {
+		if _, err := b.setRecord(input, rrs, dopts, typeA, t.ID, pID, false); err != nil {
 			return err
 		}
 
@@ -648,9 +721,13 @@ func (b *Backend) MigrateRecord(opts *model.MigrateRecord) error {
 				TTL:             aws.Int64(int64(b.TTL)),
 			}
 
-			if _, err := b.setRecord(rrs, dopts, typeA, t.ID, pID, true); err != nil {
+			if _, err := b.setRecord(input, rrs, dopts, typeA, t.ID, pID, true); err != nil {
 				return err
 			}
+		}
+
+		if err := b.submitChanges(input); err != nil {
+			return errors.Wrapf(err, errUpsertRoute53Record, typeTXT, opts.Fqdn)
 		}
 	}
 	return nil
@@ -748,29 +825,27 @@ func (b *Backend) getRecords(opts *model.DomainOptions, rType string) (*route53.
 	return output, nil
 }
 
+func (b *Backend) submitChanges(input *route53.ChangeResourceRecordSetsInput) error {
+	if len(input.ChangeBatch.Changes) > 0 {
+		if _, err := b.Svc.ChangeResourceRecordSets(input); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // Used to set record:
 //   parameters:
 //     rType: record's type(0: TXT, 1: A, 2: SUB)
 //     tID: reference token ID
 //     pID: reference parent ID
 //     sub: whether is sub domain or not
-func (b *Backend) setRecord(rrs *route53.ResourceRecordSet, opts *model.DomainOptions, rType string, tID, pID int64, sub bool) (int64, error) {
+func (b *Backend) setRecord(input *route53.ChangeResourceRecordSetsInput, rrs *route53.ResourceRecordSet, opts *model.DomainOptions, rType string, tID, pID int64, sub bool) (int64, error) {
 	if len(rrs.ResourceRecords) >= 1 {
-		input := route53.ChangeResourceRecordSetsInput{
-			HostedZoneId: aws.String(b.ZoneID),
-			ChangeBatch: &route53.ChangeBatch{
-				Changes: []*route53.Change{
-					{
-						Action:            aws.String("UPSERT"),
-						ResourceRecordSet: rrs,
-					},
-				},
-			},
-		}
-
-		if _, err := b.Svc.ChangeResourceRecordSets(&input); err != nil {
-			return 0, errors.Wrapf(err, errUpsertRoute53Record, rType, opts.Fqdn)
-		}
+		input.ChangeBatch.Changes = append(input.ChangeBatch.Changes, &route53.Change{
+			Action:            aws.String("UPSERT"),
+			ResourceRecordSet: rrs,
+		})
 	}
 
 	// set record to database
@@ -786,26 +861,16 @@ func (b *Backend) setRecord(rrs *route53.ResourceRecordSet, opts *model.DomainOp
 //   parameters:
 //     rType: record's type(0: TXT, 1: A, 2: SUB)
 //     sub: whether is sub domain or not
-func (b *Backend) deleteRecord(rrs *route53.ResourceRecordSet, opts *model.DomainOptions, rType string, sub bool) error {
-	input := route53.ChangeResourceRecordSetsInput{
-		HostedZoneId: aws.String(b.ZoneID),
-		ChangeBatch: &route53.ChangeBatch{
-			Changes: []*route53.Change{
-				{
-					Action: aws.String("DELETE"),
-					ResourceRecordSet: &route53.ResourceRecordSet{
-						Name:            rrs.Name,
-						Type:            aws.String(rType),
-						ResourceRecords: rrs.ResourceRecords,
-						TTL:             aws.Int64(int64(b.TTL)),
-					},
-				},
-			},
+func (b *Backend) deleteRecord(input *route53.ChangeResourceRecordSetsInput, rrs *route53.ResourceRecordSet, opts *model.DomainOptions, rType string, sub bool) error {
+	input.ChangeBatch.Changes = append(input.ChangeBatch.Changes, &route53.Change{
+		Action: aws.String("DELETE"),
+		ResourceRecordSet: &route53.ResourceRecordSet{
+			Name:            rrs.Name,
+			Type:            aws.String(rType),
+			ResourceRecords: rrs.ResourceRecords,
+			TTL:             aws.Int64(int64(b.TTL)),
 		},
-	}
-	if _, err := b.Svc.ChangeResourceRecordSets(&input); err != nil {
-		return errors.Wrapf(err, errDeleteRoute53Record, rType, opts.Fqdn)
-	}
+	})
 
 	// delete record from database
 	if err := b.deleteRecordFromDatabase(rrs, rType, sub); err != nil {
