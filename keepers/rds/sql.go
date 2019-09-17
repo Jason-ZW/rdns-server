@@ -172,6 +172,14 @@ func (r *RDS) putSubDomain(tx *sql.Tx, domain string, content string) (int64, er
 	return result.LastInsertId()
 }
 
+func (r *RDS) delToken(tx *sql.Tx, payload types.Payload) (int64, error) {
+	result, err := tx.Exec("DELETE FROM token WHERE fqdn = ?", payload.Fqdn)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
 func (r *RDS) delEmpty(tx *sql.Tx, payload types.Payload) (int64, error) {
 	name := "empty." + utils.GetDNSRootName(payload.Fqdn, payload.Wildcard)
 	result, err := tx.Exec("DELETE FROM record_a WHERE fqdn = ?", name)

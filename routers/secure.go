@@ -1,11 +1,13 @@
 package routers
 
 import (
+	"bytes"
 	"encoding/json"
 	"io/ioutil"
 	"net/http"
 	"strings"
 
+	"github.com/rancher/rdns-server/keepers"
 	"github.com/rancher/rdns-server/providers"
 	"github.com/rancher/rdns-server/types"
 	"github.com/rancher/rdns-server/utils"
@@ -22,6 +24,7 @@ const (
 var (
 	excludeAPIMethods = []string{"POST"}
 	excludeAPIs       = []string{"domains"}
+	specialAPI        = "/txt"
 )
 
 func secure() *mux.Router {
@@ -34,11 +37,11 @@ func secure() *mux.Router {
 	secure.Methods(http.MethodDelete).Path("/domain/{fqdn}").HandlerFunc(del)
 	secure.Methods(http.MethodPut).Path("/domain/{fqdn}/renew").HandlerFunc(renew)
 	secure.Methods(http.MethodGet).Path("/domain/{fqdn}/txt").HandlerFunc(getTXT)
-	secure.Methods(http.MethodPost).Path("/domain/{fqdn}/txt").HandlerFunc(postTXT)
+	secure.Methods(http.MethodPost).Path("/domain/txt").HandlerFunc(postTXT)
 	secure.Methods(http.MethodPut).Path("/domain/{fqdn}/txt").HandlerFunc(putTXT)
 	secure.Methods(http.MethodDelete).Path("/domain/{fqdn}/txt").HandlerFunc(delTXT)
 	secure.Methods(http.MethodGet).Path("/domain/{fqdn}/cname").HandlerFunc(getCNAME)
-	secure.Methods(http.MethodPost).Path("/domain/{fqdn}/cname").HandlerFunc(postCNAME)
+	secure.Methods(http.MethodPost).Path("/domain/cname").HandlerFunc(postCNAME)
 	secure.Methods(http.MethodPut).Path("/domain/{fqdn}/cname").HandlerFunc(putCNAME)
 	secure.Methods(http.MethodDelete).Path("/domain/{fqdn}/cname").HandlerFunc(delCNAME)
 	return secure
@@ -63,7 +66,7 @@ func get(res http.ResponseWriter, req *http.Request) {
 		Fqdn: mux.Vars(req)["fqdn"],
 	}
 
-	if req.URL.Query().Get("type") == "AAAA" {
+	if req.URL.Query().Get("type") == types.RecordTypeAAAA {
 		payload.Type = types.RecordTypeAAAA
 	} else {
 		payload.Type = types.RecordTypeA
@@ -100,7 +103,7 @@ func post(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if req.URL.Query().Get("type") == "AAAA" {
+	if req.URL.Query().Get("type") == types.RecordTypeAAAA {
 		payload.Type = types.RecordTypeAAAA
 	} else {
 		payload.Type = types.RecordTypeA
@@ -145,7 +148,7 @@ func put(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if req.URL.Query().Get("type") == "AAAA" {
+	if req.URL.Query().Get("type") == types.RecordTypeAAAA {
 		payload.Type = types.RecordTypeAAAA
 	} else {
 		payload.Type = types.RecordTypeA
@@ -172,7 +175,7 @@ func del(res http.ResponseWriter, req *http.Request) {
 		Fqdn: mux.Vars(req)["fqdn"],
 	}
 
-	if req.URL.Query().Get("type") == "AAAA" {
+	if req.URL.Query().Get("type") == types.RecordTypeAAAA {
 		payload.Type = types.RecordTypeAAAA
 	} else {
 		payload.Type = types.RecordTypeA
@@ -181,6 +184,10 @@ func del(res http.ResponseWriter, req *http.Request) {
 	if !completePayload(&payload, false) {
 		responseWithError(res, http.StatusBadRequest, errors.New("request not valid"))
 		return
+	}
+
+	if req.URL.Query().Get("cleanup") != "" {
+		payload.Cleanup = req.URL.Query().Get("cleanup")
 	}
 
 	_, err := p.Delete(payload)
@@ -200,7 +207,7 @@ func renew(res http.ResponseWriter, req *http.Request) {
 	}
 
 	if payload.Type == "" {
-		if req.URL.Query().Get("type") == "AAAA" {
+		if req.URL.Query().Get("type") == types.RecordTypeAAAA {
 			payload.Type = types.RecordTypeAAAA
 		} else {
 			payload.Type = types.RecordTypeA
@@ -253,7 +260,6 @@ func postTXT(res http.ResponseWriter, req *http.Request) {
 	}
 
 	payload := types.Payload{
-		Fqdn: mux.Vars(req)["fqdn"],
 		Type: types.RecordTypeTXT,
 	}
 
@@ -330,6 +336,10 @@ func delTXT(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if req.URL.Query().Get("cleanup") != "" {
+		payload.Cleanup = req.URL.Query().Get("cleanup")
+	}
+
 	_, err := p.DeleteTXT(payload)
 	if err != nil {
 		responseWithError(res, http.StatusInternalServerError, errors.New("delete record(s) failed"))
@@ -371,7 +381,6 @@ func postCNAME(res http.ResponseWriter, req *http.Request) {
 	}
 
 	payload := types.Payload{
-		Fqdn: mux.Vars(req)["fqdn"],
 		Type: types.RecordTypeCNAME,
 	}
 
@@ -448,6 +457,10 @@ func delCNAME(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	if req.URL.Query().Get("cleanup") != "" {
+		payload.Cleanup = req.URL.Query().Get("cleanup")
+	}
+
 	_, err := p.DeleteCNAME(payload)
 	if err != nil {
 		responseWithError(res, http.StatusInternalServerError, errors.New("delete record(s) failed"))
@@ -459,11 +472,12 @@ func delCNAME(res http.ResponseWriter, req *http.Request) {
 
 // completePayload payload completion.
 func completePayload(payload *types.Payload, valid bool) bool {
-	if valid && payload.Text != "" && (len(payload.Hosts) > 0 || len(payload.SubDomain) > 0) {
+	if valid && (payload.Text != "" && (len(payload.Hosts) > 0 || len(payload.SubDomain) > 0)) ||
+		(payload.CNAME != "" && (len(payload.Hosts) > 0 || len(payload.SubDomain) > 0)) {
 		return false
 	}
 
-	if valid && payload.Text == "" && len(payload.Hosts) <= 0 && len(payload.SubDomain) <= 0 {
+	if valid && payload.Text == "" && payload.CNAME == "" && len(payload.Hosts) <= 0 && len(payload.SubDomain) <= 0 {
 		return false
 	}
 
@@ -475,11 +489,15 @@ func completePayload(payload *types.Payload, valid bool) bool {
 		payload.Type = types.RecordTypeTXT
 	}
 
+	if payload.CNAME != "" {
+		payload.Type = types.RecordTypeCNAME
+	}
+
 	if len(payload.Hosts) > 0 {
 		payload.Type = utils.HostType(payload.Hosts[0])
 	}
 
-	if payload.Text == "" && len(payload.Hosts) <= 0 && len(payload.SubDomain) > 0 {
+	if payload.Text == "" && payload.CNAME == "" && len(payload.Hosts) <= 0 && len(payload.SubDomain) > 0 {
 		for _, v := range payload.SubDomain {
 			payload.Type = utils.HostType(v[0])
 			break
@@ -494,9 +512,41 @@ func tokenMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		intercept := true
 		for _, e := range excludeAPIMethods {
-			if r.Method == e {
+			if r.Method == e && !strings.Contains(r.RequestURI, specialAPI) {
 				intercept = false
 				break
+			}
+			if r.Method == e && strings.Contains(r.RequestURI, specialAPI) {
+				// if keeper already contains a record which relative to the current fqdn is a higher level
+				// then the request should be intercepted.
+				body, err := ioutil.ReadAll(r.Body)
+				if err != nil {
+					responseWithError(w, http.StatusInternalServerError, err)
+					return
+				}
+				r.Body = ioutil.NopCloser(bytes.NewBuffer(body))
+
+				payload := types.Payload{}
+
+				err = json.Unmarshal(body, &payload)
+				if err != nil {
+					responseWithError(w, http.StatusInternalServerError, err)
+					return
+				}
+				if payload.Fqdn != "" {
+					intercept = false
+					break
+				}
+
+				keep, _ := keepers.GetKeeper().GetKeep(
+					types.Payload{
+						Fqdn:     utils.Level1WithZone(utils.GetDNSRootName(payload.Fqdn, strings.Contains(payload.Fqdn, "*"))),
+						Wildcard: strings.Contains(payload.Fqdn, "*"),
+					})
+				if keep.Domain == "" {
+					intercept = false
+					break
+				}
 			}
 		}
 

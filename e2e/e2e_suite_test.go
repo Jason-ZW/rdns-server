@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/rancher/rdns-server/types"
+
 	"github.com/go-resty/resty/v2"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -14,7 +16,7 @@ import (
 
 var (
 	client  *resty.Client
-	domains map[string]string
+	domains map[string]map[string]string
 )
 
 func TestE2E(t *testing.T) {
@@ -45,16 +47,28 @@ var _ = BeforeSuite(func() {
 var _ = AfterSuite(func() {
 	// clean up all e2e records.
 	for k, v := range domains {
-		response, err := client.R().SetAuthToken(v).Delete("/v1/domain/" + k)
-		if err != nil {
-			logrus.Errorf("failed to cleanup e2e record(s): %v", k)
+		for kk, vv := range v {
+			url := "/v1/domain/" + kk
+			switch k {
+			case types.RecordTypeA:
+				url = url + "?cleanup=true"
+			case types.RecordTypeAAAA:
+				url = url + "?cleanup=true&type=AAAA"
+			case types.RecordTypeCNAME:
+				url = url + "/cname?cleanup=true"
+			case types.RecordTypeTXT:
+				url = url + "/txt?cleanup=true"
+			default:
+				logrus.Errorln("unsupported dns types")
+			}
+			response, err := client.R().SetAuthToken(vv).Delete(url)
+			if err != nil {
+				logrus.Errorf("failed to cleanup e2e record(s): %v", kk)
+			}
+			if response.StatusCode() != http.StatusOK {
+				logrus.Errorf("failed to cleanup e2e record(s): %v", response.Request.URL)
+			}
 		}
-
-		if response.StatusCode() != http.StatusOK {
-			logrus.Errorf("failed to cleanup e2e record(s): %v", response.Request.URL)
-		}
-
-		delete(domains, k)
 	}
 	client = nil
 })

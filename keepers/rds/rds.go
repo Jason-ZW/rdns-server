@@ -361,6 +361,12 @@ func (r *RDS) DeleteKeeps(payload types.Payload) (keepers.Keep, error) {
 			return errors.New("unknown record type")
 		}
 
+		if payload.Cleanup == "true" {
+			if _, err := r.delToken(tx, payload); err != nil {
+				return err
+			}
+		}
+
 		return nil
 	})
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/rancher/rdns-server/types"
+	"github.com/rancher/rdns-server/utils"
 
 	"github.com/miekg/dns"
 	. "github.com/onsi/ginkgo"
@@ -27,6 +28,7 @@ const (
 type e2ePayload struct {
 	Method string
 	URI    string
+	Auth   string
 	Body   string
 	Type   string
 }
@@ -218,11 +220,138 @@ var _ = Describe("e2e", func() {
 					RootAddresses: []string{"192.168.1.1"},
 				},
 			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/cname",
+					Body:   `{"cname": "test1.rancher-cn-test.com"}`,
+					Type:   types.RecordTypeCNAME,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       false,
+				},
+				dnsExpect: e2eDNSExpect{
+					CNAME: "test1.rancher-cn-test.com",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/cname",
+					Body:   `{"fqdn": "test45678.rancher-cn-test.com", "cname": "test2.rancher-cn-test.com"}`,
+					Type:   types.RecordTypeCNAME,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       false,
+				},
+				dnsExpect: e2eDNSExpect{
+					CNAME: "test2.rancher-cn-test.com",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/cname",
+					Body:   `{"fqdn": "*.test56789.rancher-cn-test.com", "cname": "test3.rancher-cn-test.com"}`,
+					Type:   types.RecordTypeCNAME,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       true,
+				},
+				dnsExpect: e2eDNSExpect{
+					CNAME: "test3.rancher-cn-test.com",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/txt",
+					Body:   `{"text": "this is text msg"}`,
+					Type:   types.RecordTypeTXT,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       false,
+				},
+				dnsExpect: e2eDNSExpect{
+					TXT: "this is text msg",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/txt",
+					Body:   `{"fqdn": "test7890.rancher-cn-test.com", "text": "this is text msg 2"}`,
+					Type:   types.RecordTypeTXT,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       false,
+				},
+				dnsExpect: e2eDNSExpect{
+					TXT: "this is text msg 2",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/txt",
+					Body:   `{"fqdn": "*.test8901.rancher-cn-test.com", "text": "this is text msg 3"}`,
+					Type:   types.RecordTypeTXT,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       true,
+				},
+				dnsExpect: e2eDNSExpect{
+					TXT: "this is text msg 3",
+				},
+			},
+			{
+				payload: e2ePayload{
+					Method: http.MethodPost,
+					URI:    "/v1/domain/txt",
+					Auth:   domains[types.RecordTypeA]["test12345.rancher-cn-test.com"],
+					Body:   `{"fqdn":"_acme-challenge.test12345.rancher-cn-test.com", "text": "acme challenge text msg"}`,
+					Type:   types.RecordTypeTXT,
+				},
+				apiExpect: e2eAPIExpect{
+					ShouldStatusOK:       true,
+					ShouldTokenEmpty:     false,
+					ShouldRootValueEmpty: false,
+					ShouldHasSubDomain:   false,
+					ShouldWildcard:       false,
+				},
+				dnsExpect: e2eDNSExpect{
+					TXT: "acme challenge text msg",
+				},
+			},
 		}
 	})
 
 	JustBeforeEach(func() {
-		domains = make(map[string]string)
+		domains = make(map[string]map[string]string)
 		client.SetHostURL(endpoint)
 	})
 
@@ -261,7 +390,7 @@ var _ = Describe("e2e", func() {
 			for _, c := range cases {
 				switch c.payload.Method {
 				case http.MethodPost:
-					resp, err := client.R().SetBody(c.payload.Body).Post(c.payload.URI)
+					resp, err := client.R().SetBody(c.payload.Body).SetAuthToken(c.payload.Auth).Post(c.payload.URI)
 					if err != nil {
 						Expect(err).NotTo(HaveOccurred())
 					}
@@ -279,11 +408,12 @@ var _ = Describe("e2e", func() {
 					if err := json.Unmarshal(resp.Body(), response); err != nil {
 						Expect(err).NotTo(HaveOccurred())
 					}
-					if c.payload.Type == types.RecordTypeAAAA {
-						domains[response.Data.Fqdn+"?type=AAAA"] = response.Data.Token
-					} else {
-						domains[response.Data.Fqdn] = response.Data.Token
+
+					if len(domains[c.payload.Type]) <= 0 {
+						domains[c.payload.Type] = make(map[string]string)
 					}
+					domains[c.payload.Type][response.Data.Fqdn] = response.Data.Token
+
 					logrus.Infof("success post %s domain request: %s: %s\n",
 						c.payload.Type, response.Data.Fqdn, response.Data.Token)
 
@@ -310,15 +440,24 @@ var _ = Describe("e2e", func() {
 					if c.apiExpect.ShouldRootValueEmpty {
 						Expect(response.Data.Hosts).To(BeEmpty())
 					} else {
-						Expect(response.Data.Hosts).NotTo(BeEmpty())
-						Expect(response.Data.Hosts).Should(ConsistOf(payload.Hosts))
+						if payload.Type == types.RecordTypeA || payload.Type == types.RecordTypeAAAA {
+							Expect(response.Data.Hosts).NotTo(BeEmpty())
+							Expect(response.Data.Hosts).Should(ConsistOf(payload.Hosts))
+						} else if payload.Type == types.RecordTypeCNAME {
+							Expect(utils.TrimTrailingDot(response.Data.CNAME)).NotTo(BeEmpty())
+							Expect(utils.TrimTrailingDot(response.Data.CNAME)).To(Equal(payload.CNAME))
+						} else if payload.Type == types.RecordTypeTXT {
+							Expect(utils.TextRemoveQuotes(utils.TrimTrailingDot(response.Data.Text))).NotTo(BeEmpty())
+							Expect(utils.TextRemoveQuotes(utils.TrimTrailingDot(response.Data.Text))).To(Equal(payload.Text))
+						}
+
 						rr, err := DNSLookup(payload.Fqdn, payload.Type)
 						if err != nil {
 							Expect(err).NotTo(HaveOccurred())
 						}
 						ExpectDNSByType(payload.Type, c.dnsExpect, rr, true, "")
 
-						if !c.apiExpect.ShouldWildcard {
+						if !c.apiExpect.ShouldWildcard && payload.Type != types.RecordTypeTXT && payload.Type != types.RecordTypeCNAME {
 							rr, err = DNSLookup("*."+payload.Fqdn, payload.Type)
 							if err != nil {
 								Expect(err).NotTo(HaveOccurred())
@@ -341,8 +480,27 @@ var _ = Describe("e2e", func() {
 						Expect(len(response.Data.SubDomain)).To(BeZero())
 					}
 				case http.MethodPut:
+					if strings.Contains(c.payload.URI, "/renew") {
+
+					} else {
+
+					}
 				case http.MethodGet:
+					if c.payload.Type == types.RecordTypeA || c.payload.Type == types.RecordTypeAAAA {
+
+					} else if c.payload.Type == types.RecordTypeCNAME {
+
+					} else if c.payload.Type == types.RecordTypeTXT {
+
+					}
 				case http.MethodDelete:
+					if c.payload.Type == types.RecordTypeA || c.payload.Type == types.RecordTypeAAAA {
+
+					} else if c.payload.Type == types.RecordTypeCNAME {
+
+					} else if c.payload.Type == types.RecordTypeTXT {
+
+					}
 				default:
 					Expect(errors.New("request method not allowed")).NotTo(HaveOccurred())
 				}
@@ -391,8 +549,11 @@ func DNSTypeToUInt16(dnsType string) uint16 {
 func ExpectDNSByType(dnsType string, expect e2eDNSExpect, rr []dns.RR, root bool, key string) {
 	ss := make([]string, 0)
 	for _, r := range rr {
-		sp := strings.Split(r.String(), "\t")
+		sp := strings.Split(utils.TextRemoveQuotes(utils.TrimTrailingDot(r.String())), "\t")
 		ss = append(ss, sp[len(sp)-1:]...)
+		for i, s := range ss {
+			ss[i] = utils.TextRemoveQuotes(s)
+		}
 	}
 	switch dnsType {
 	case types.RecordTypeA:
@@ -408,7 +569,7 @@ func ExpectDNSByType(dnsType string, expect e2eDNSExpect, rr []dns.RR, root bool
 			Expect(ss).Should(ConsistOf(expect.SubAddresses[key]))
 		}
 	case types.RecordTypeCNAME:
-		Expect(ss).Should(ConsistOf(expect.CNAME))
+		Expect(ss).Should(ConsistOf([]string{expect.CNAME}))
 	case types.RecordTypeTXT:
 		Expect(ss).Should(ConsistOf(expect.TXT))
 	default:
