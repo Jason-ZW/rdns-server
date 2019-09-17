@@ -5,9 +5,9 @@ source $(dirname $0)/version
 
 cd $(dirname $0)/..
 
-BUILDDATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
 
-CONST="-X main.DNSVersion=${VERSION} -X main.DNSDate='${BUILDDATE}'"
+CONST="-X main.DNSVersion=${VERSION} -X main.DNSDate='${BUILD_DATE}'"
 
 mkdir -p bin
 GOARCH=$ARCH GOOS=linux CGO_ENABLED=0 go build -ldflags "$CONST -extldflags -static -s -w" -o bin/rdns-server

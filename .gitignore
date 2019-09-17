@@ -4,5 +4,6 @@
 *.swp
 /.trash-cache
 .idea/
+.DS_Store
 main
 .DS_Store
